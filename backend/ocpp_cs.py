@@ -1,26 +1,22 @@
 import logging
 from datetime import datetime, timezone
-
 from ocpp.routing import on
 from ocpp.v16 import ChargePoint as CP, call_result, call
 from ocpp.v16.enums import (
-    RegistrationStatus,
-    Action,
-    ChargingRateUnitType,
-    ChargingProfilePurposeType,
-    ChargingProfileKindType,
+    RegistrationStatus, Action, ChargingRateUnitType,
+    ChargingProfilePurposeType, ChargingProfileKindType,
 )
-from ocpp.v16.datatypes import (
-    ChargingSchedule,
-    ChargingSchedulePeriod,
-    ChargingProfile,
-)
-from models import STATE, ChargePointState
+from ocpp.v16.datatypes import ChargingSchedule, ChargingSchedulePeriod, ChargingProfile
+from models import STATE, ChargePointState, ENERGY_LOGS
 
 logger = logging.getLogger(__name__)
 
 def amps_from_kw(kw: float, phases: int, voltage: float) -> float:
     return max(0.0, kw * 1000.0 / (max(1.0, voltage) * max(1, phases)))
+
+def _try_float(x):
+    try: return float(x)
+    except: return None
 
 class CentralSystem(CP):
     @on(Action.boot_notification)
@@ -49,31 +45,63 @@ class CentralSystem(CP):
 
     @on(Action.meter_values)
     async def on_meter(self, meter_value, connector_id, **kwargs):
+        """
+        Liest SoC (%), Energie-Zähler (kWh) aus MeterValues.
+        Energie:
+          - bevorzugt measurand 'Energy.Active.Import.Register'
+          - unit Wh -> /1000
+          - unit kWh -> direkt
+        """
         try:
             soc_found = None
+            energy_kwh = None
+            ts = datetime.now(timezone.utc)
+
             for mv in (meter_value or []):
+                # Timestamp (falls geliefert)
+                ts_iso = mv.get("timestamp")
+                if ts_iso:
+                    try: ts = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+                    except: pass
+
                 for sv in mv.get("sampled_value", []):
                     meas = (sv.get("measurand") or sv.get("measured_value") or "").lower()
-                    if meas in ["soc", "stateofcharge", "state_of_charge"]:
-                        raw = sv.get("value")
-                        if raw is not None:
-                            try:
-                                soc_found = max(0, min(100, int(float(raw))))
-                            except Exception:
-                                pass
-                    elif not meas and (sv.get("unit", "").lower() in ["percent", "%"]):
-                        raw = sv.get("value")
-                        if raw is not None:
-                            try:
-                                soc_found = max(0, min(100, int(float(raw))))
-                            except Exception:
-                                pass
-            if soc_found is not None:
-                st = STATE.get(self.id)
-                if st:
+                    unit = (sv.get("unit") or "").lower()
+                    val  = sv.get("value")
+
+                    # SoC
+                    if meas in ["soc", "stateofcharge", "state_of_charge"] or (not meas and unit in ["percent", "%"]):
+                        v = _try_float(val)
+                        if v is not None:
+                            soc_found = max(0, min(100, int(v)))
+
+                    # Energie
+                    if meas in ["energy.active.import.register", "energy.active.import"] or ("energy" in meas and "import" in meas):
+                        v = _try_float(val)
+                        if v is not None:
+                            if unit in ["wh"]:
+                                energy_kwh = max(0.0, v / 1000.0)
+                            else:
+                                # angenommen kWh oder unbekannt -> kWh
+                                energy_kwh = max(0.0, v)
+
+            st = STATE.get(self.id)
+            if st:
+                if soc_found is not None:
                     st.current_soc = soc_found
                     st.soc = soc_found
-                logger.info("MeterValues SoC from %s -> %s%% (connector %s)", self.id, soc_found, connector_id)
+                if energy_kwh is not None:
+                    st.energy_kwh_total = energy_kwh
+                    ENERGY_LOGS.setdefault(self.id, []).append((ts, energy_kwh))
+                    # prune: optional, um Größe zu begrenzen (z. B. > 60 Tage)
+                    logs = ENERGY_LOGS[self.id]
+                    if len(logs) > 5000:
+                        ENERGY_LOGS[self.id] = logs[-4000:]
+            if soc_found is not None:
+                logger.info("MeterValues SoC %s -> %s%%", self.id, soc_found)
+            if energy_kwh is not None:
+                logger.info("MeterValues Energy %s -> %.3f kWh", self.id, energy_kwh)
+
         except Exception as e:
             logger.exception("Error parsing MeterValues for %s: %s", self.id, e)
 
