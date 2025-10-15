@@ -1,44 +1,33 @@
 import asyncio, logging, os
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, WebSocket, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 
 from ocpp_cs import CentralSystem
-from models import STATE
+from models import STATE, ENERGY_LOGS
 from scheduler import control_loop
+from mailer import send_mail, fmt_ts
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
-
 app = FastAPI()
 
-# CORS
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").split(",")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=ALLOW_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 
-# globaler Zustand
 app.state.cps = {}
-# Eco-Config im Speicher (nur sunny_kw / cloudy_kw)
 app.state.eco = {
     "sunny_kw": float(os.getenv("SUNNY_KW", "11.0")),
     "cloudy_kw": float(os.getenv("CLOUDY_KW", "3.7")),
 }
 
 # WebSocket Adapter
-from fastapi import WebSocket
 class FastAPIWebSocketAdapter:
-    def __init__(self, ws: WebSocket):
-        self.ws = ws
-    async def recv(self) -> str:
-        return await self.ws.receive_text()
-    async def send(self, message: str):
-        await self.ws.send_text(message)
+    def __init__(self, ws: WebSocket): self.ws = ws
+    async def recv(self) -> str: return await self.ws.receive_text()
+    async def send(self, message: str): await self.ws.send_text(message)
 
 @app.websocket("/ocpp/{cp_id}")
 async def ocpp(ws: WebSocket, cp_id: str):
@@ -51,6 +40,9 @@ async def ocpp(ws: WebSocket, cp_id: str):
         await cp.start()
     except Exception as e:
         logging.exception("WS error %s: %s", cp_id, e)
+        subj = f"[EMS] Backend-Fehler OCPP WS – {cp_id}"
+        body = f"Ladepunkt: {cp_id}\nZeit: {fmt_ts()}\nFehler: {repr(e)}"
+        asyncio.create_task(send_mail(subj, body))
         raise
     finally:
         logging.info("WS disconnected: %s", cp_id)
@@ -78,9 +70,13 @@ def set_limit(cp_id: str, kw: float):
         from models import ChargePointState
         STATE[cp_id] = ChargePointState(id=cp_id)
     STATE[cp_id].target_kw = kw
+    # Optional: sofort pushen? -> wenn OCPP-Session aktiv, man kann hier push auslösen
+    cp = app.state.cps.get(cp_id)
+    if cp:
+        asyncio.create_task(cp.push_charging_profile(kw))
     return {"ok": True}
 
-# SoC manuell setzen (Fallback neben OCPP-Auto-SoC)
+# SoC manuell
 @app.post("/api/points/{cp_id}/soc")
 def set_soc(cp_id: str, soc: int = Body(..., embed=True)):
     if cp_id not in STATE:
@@ -90,55 +86,86 @@ def set_soc(cp_id: str, soc: int = Body(..., embed=True)):
     STATE[cp_id].soc = int(soc)
     return {"ok": True}
 
-# Boost im Eco – pro Lader
+# Boost (Eco)
 @app.get("/api/points/{cp_id}/boost")
 def get_boost(cp_id: str):
     s = STATE.get(cp_id)
-    if not s:
-        return {"enabled": False}
-    return {
-        "enabled": s.boost_enabled,
-        "cutoff_local": s.boost_cutoff_local,
-        "target_soc": s.boost_target_soc,
-    }
+    if not s: return {"enabled": False}
+    return {"enabled": s.boost_enabled, "cutoff_local": s.boost_cutoff_local, "target_soc": s.boost_target_soc}
 
 @app.post("/api/points/{cp_id}/boost")
-def set_boost(
-    cp_id: str,
-    enabled: bool = Body(...),
-    cutoff_local: str = Body(..., embed=True),
-    target_soc: int = Body(...),
-):
+def set_boost(cp_id: str, enabled: bool = Body(...), cutoff_local: str = Body(..., embed=True), target_soc: int = Body(...)):
     from models import ChargePointState
     s = STATE.get(cp_id) or ChargePointState(id=cp_id)
     s.boost_enabled = bool(enabled)
     s.boost_cutoff_local = cutoff_local
     s.boost_target_soc = int(target_soc)
+    if not enabled:
+        s.boost_reached_notified = False
     STATE[cp_id] = s
-    # Boost ist eine Erweiterung von Eco; Modus bleibt Eco
-    if s.mode == "off":
-        s.mode = "eco"
+    if s.mode == "off": s.mode = "eco"
     return {"ok": True}
 
-# Eco-Config (nur sunny_kw / cloudy_kw)
+# Eco-Config
 @app.get("/api/config/eco")
-def get_eco():
-    return app.state.eco
+def get_eco(): return app.state.eco
 
 @app.post("/api/config/eco")
-def post_eco(
-    sunny_kw: float = Body(...),
-    cloudy_kw: float = Body(...),
-):
+def post_eco(sunny_kw: float = Body(...), cloudy_kw: float = Body(...)):
     app.state.eco["sunny_kw"] = float(sunny_kw)
     app.state.eco["cloudy_kw"] = float(cloudy_kw)
     return {"ok": True, **app.state.eco}
 
-@app.get("/")
-def root():
-    return {"ok": True, "msg": "EMS backend running"}
+# Statistik: kWh letzte 7 / 30 Tage (gesamt + pro Lader)
+def _sum_range_kwh(points):
+    now = datetime.now(timezone.utc)
+    out = {"7d": 0.0, "30d": 0.0}
+    for days in (7, 30):
+        since = now - timedelta(days=days)
+        total = 0.0
+        for cp_id, rows in points.items():
+            if not rows: continue
+            # nehme min/max innerhalb des Fensters (Register ist kumulativ)
+            first = None
+            last  = None
+            for ts, kwh in rows:
+                if ts >= since:
+                    if first is None: first = kwh
+                    last = kwh
+            if first is not None and last is not None:
+                total += max(0.0, last - first)
+        out[f"{days}d"] = round(total, 2)
+    return out
 
-# Startup-Loop
+def _sum_range_kwh_per_cp(points):
+    now = datetime.now(timezone.utc)
+    out = {}
+    for cp_id, rows in points.items():
+        res = {"7d": 0.0, "30d": 0.0}
+        for days in (7, 30):
+            since = now - timedelta(days=days)
+            first = None; last = None
+            for ts, kwh in rows:
+                if ts >= since:
+                    if first is None: first = kwh
+                    last = kwh
+            if first is not None and last is not None:
+                res[f"{days}d"] = round(max(0.0, last - first), 2)
+        out[cp_id] = res
+    return out
+
+@app.get("/api/stats")
+def stats():
+    # Hinweis: In-Memory; geht bei Restart verloren
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "total": _sum_range_kwh(ENERGY_LOGS),
+        "by_point": _sum_range_kwh_per_cp(ENERGY_LOGS),
+    }
+
+@app.get("/")
+def root(): return {"ok": True, "msg": "EMS backend running"}
+
 @app.on_event("startup")
 async def on_start():
     lat = float(os.getenv("LAT", "48.87"))
@@ -146,6 +173,5 @@ async def on_start():
     base_limit_kw = float(os.getenv("BASE_LIMIT_KW", "11"))
     asyncio.create_task(control_loop(app, lat, lon, base_limit_kw))
 
-# Statische Dateien optional
 if os.path.isdir("static"):
     app.mount("/", StaticFiles(directory="static", html=True), name="static")
