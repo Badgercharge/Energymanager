@@ -1,0 +1,19 @@
+from typing import Dict, Optional, Literal
+from dataclasses import dataclass
+from datetime import datetime
+
+Mode = Literal["eco","max","off","schedule"]
+
+@dataclass
+class ChargePointState:
+    id: str
+    connected: bool = False
+    last_heartbeat: Optional[datetime] = None
+    mode: Mode = "eco"
+    target_kw: float = 0.0
+    phase_count: int = 3
+    voltage_per_phase: float = 230.0
+    max_current_a: float = 16.0
+    soc: Optional[int] = None
+
+STATE: Dict[str, ChargePointState] = {}
