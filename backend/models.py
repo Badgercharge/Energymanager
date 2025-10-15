@@ -1,9 +1,8 @@
-# backend/models.py
 from typing import Dict, Optional, Literal
 from dataclasses import dataclass
 from datetime import datetime
 
-Mode = Literal["eco","max","off","schedule"]
+Mode = Literal["eco", "max", "off"]
 
 @dataclass
 class ChargePointState:
@@ -15,14 +14,14 @@ class ChargePointState:
     phase_count: int = 3
     voltage_per_phase: float = 230.0
     max_current_a: float = 16.0
+
+    # SoC (auto via MeterValues oder manuell)
     soc: Optional[int] = None
+    current_soc: Optional[int] = None
 
-    # Schedule-Parameter
-    schedule_enabled: bool = False
-    cutoff_local: str = "07:00"      # HH:MM lokale Zeit
-    target_soc: int = 80             # %
-    current_soc: int = 40            # %
-    battery_kwh: float = 60.0        # kWh
-    charge_efficiency: float = 0.92  # 92% Standardwirkungsgrad
-
+    # Boost im Eco (per Lader)
+    boost_enabled: bool = False
+    boost_cutoff_local: str = "07:00"  # HH:MM lokale Zeit
+    boost_target_soc: int = 80         # %
+    
 STATE: Dict[str, ChargePointState] = {}
