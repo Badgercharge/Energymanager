@@ -2,7 +2,6 @@ import asyncio, logging, os
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from ocpp.transport import WebSocket as OcppWebSocket
 from dotenv import load_dotenv
 
 from ocpp_cs import CentralSystem
@@ -25,11 +24,21 @@ app.add_middleware(
 
 app.state.cps = {}
 
+# Minimaler Adapter, der dem OCPP-ChargePoint ein send/recv-Interface bietet
+class FastAPIWebSocketAdapter:
+    def __init__(self, ws: WebSocket):
+        self.ws = ws
+    async def recv(self) -> str:
+        # erwartet Textframes
+        return await self.ws.receive_text()
+    async def send(self, message: str):
+        await self.ws.send_text(message)
+
 @app.websocket("/ocpp/{cp_id}")
 async def ocpp(ws: WebSocket, cp_id: str):
     # ocpp>=2.x: Subprotocol-String direkt verwenden
     await ws.accept(subprotocol="ocpp1.6")
-    ocpp_ws = OcppWebSocket(ws)
+    ocpp_ws = FastAPIWebSocketAdapter(ws)
     cp = CentralSystem(cp_id, ocpp_ws)
     app.state.cps[cp_id] = cp
     try:
