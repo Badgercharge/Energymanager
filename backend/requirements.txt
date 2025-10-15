@@ -1,0 +1,7 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-ocpp==0.13.1
+pydantic==2.8.2
+aiohttp==3.10.5
+apscheduler==3.10.4
+python-dotenv==1.0.1
