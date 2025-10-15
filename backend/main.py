@@ -11,10 +11,9 @@ from scheduler import control_loop
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
-# 1) app zuerst erstellen
 app = FastAPI()
 
-# 2) Middleware danach
+# CORS
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
@@ -23,10 +22,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 3) App-weit genutzter Zustand
+# globaler Zustand
 app.state.cps = {}
+# Eco-Config im Speicher (nur sunny_kw / cloudy_kw)
+app.state.eco = {
+    "sunny_kw": float(os.getenv("SUNNY_KW", "11.0")),
+    "cloudy_kw": float(os.getenv("CLOUDY_KW", "3.7")),
+}
 
-# 4) WebSocket-Endpoint: hier wird app bereits existieren
+# WebSocket Adapter
+from fastapi import WebSocket
 class FastAPIWebSocketAdapter:
     def __init__(self, ws: WebSocket):
         self.ws = ws
@@ -37,26 +42,30 @@ class FastAPIWebSocketAdapter:
 
 @app.websocket("/ocpp/{cp_id}")
 async def ocpp(ws: WebSocket, cp_id: str):
-    # ocpp1.6 Subprotocol direkt verwenden
     await ws.accept(subprotocol="ocpp1.6")
+    logging.info("WS connected: %s", cp_id)
     ocpp_ws = FastAPIWebSocketAdapter(ws)
     cp = CentralSystem(cp_id, ocpp_ws)
     app.state.cps[cp_id] = cp
     try:
         await cp.start()
+    except Exception as e:
+        logging.exception("WS error %s: %s", cp_id, e)
+        raise
     finally:
+        logging.info("WS disconnected: %s", cp_id)
         if cp_id in STATE:
             STATE[cp_id].connected = False
         app.state.cps.pop(cp_id, None)
 
-# 5) HTTP-Endpoints
+# REST: Points
 @app.get("/api/points")
 def list_points():
     return [vars(s) for s in STATE.values()]
 
 @app.post("/api/points/{cp_id}/mode/{mode}")
 def set_mode(cp_id: str, mode: str):
-    assert mode in ["eco","max","off","schedule"]
+    assert mode in ["eco", "max", "off"]
     if cp_id not in STATE:
         from models import ChargePointState
         STATE[cp_id] = ChargePointState(id=cp_id)
@@ -71,46 +80,7 @@ def set_limit(cp_id: str, kw: float):
     STATE[cp_id].target_kw = kw
     return {"ok": True}
 
-@app.get("/")
-def root():
-    return {"ok": True, "msg": "EMS backend running"}
-
-# 6) Schedule-/SoC-Endpoints
-@app.get("/api/points/{cp_id}/schedule")
-def get_schedule(cp_id: str):
-    s = STATE.get(cp_id)
-    if not s:
-        return {"enabled": False}
-    return {
-        "enabled": s.schedule_enabled,
-        "cutoff_local": s.cutoff_local,
-        "target_soc": s.target_soc,
-        "current_soc": s.current_soc,
-        "battery_kwh": s.battery_kwh,
-        "charge_efficiency": s.charge_efficiency,
-    }
-
-@app.post("/api/points/{cp_id}/schedule")
-def set_schedule(
-    cp_id: str,
-    enabled: bool = Body(...),
-    cutoff_local: str = Body(..., embed=True),
-    target_soc: int = Body(...),
-    battery_kwh: float = Body(...),
-    charge_efficiency: float = Body(0.92),
-):
-    from models import ChargePointState
-    s = STATE.get(cp_id) or ChargePointState(id=cp_id)
-    s.schedule_enabled = enabled
-    s.cutoff_local = cutoff_local
-    s.target_soc = int(target_soc)
-    s.battery_kwh = float(battery_kwh)
-    s.charge_efficiency = float(charge_efficiency)
-    STATE[cp_id] = s
-    if enabled:
-        s.mode = "schedule"
-    return {"ok": True}
-
+# SoC manuell setzen (Fallback neben OCPP-Auto-SoC)
 @app.post("/api/points/{cp_id}/soc")
 def set_soc(cp_id: str, soc: int = Body(..., embed=True)):
     if cp_id not in STATE:
@@ -120,15 +90,62 @@ def set_soc(cp_id: str, soc: int = Body(..., embed=True)):
     STATE[cp_id].soc = int(soc)
     return {"ok": True}
 
-# 7) Startup-Task am Ende anlegen (nutzt app, das es schon gibt)
+# Boost im Eco – pro Lader
+@app.get("/api/points/{cp_id}/boost")
+def get_boost(cp_id: str):
+    s = STATE.get(cp_id)
+    if not s:
+        return {"enabled": False}
+    return {
+        "enabled": s.boost_enabled,
+        "cutoff_local": s.boost_cutoff_local,
+        "target_soc": s.boost_target_soc,
+    }
+
+@app.post("/api/points/{cp_id}/boost")
+def set_boost(
+    cp_id: str,
+    enabled: bool = Body(...),
+    cutoff_local: str = Body(..., embed=True),
+    target_soc: int = Body(...),
+):
+    from models import ChargePointState
+    s = STATE.get(cp_id) or ChargePointState(id=cp_id)
+    s.boost_enabled = bool(enabled)
+    s.boost_cutoff_local = cutoff_local
+    s.boost_target_soc = int(target_soc)
+    STATE[cp_id] = s
+    # Boost ist eine Erweiterung von Eco; Modus bleibt Eco
+    if s.mode == "off":
+        s.mode = "eco"
+    return {"ok": True}
+
+# Eco-Config (nur sunny_kw / cloudy_kw)
+@app.get("/api/config/eco")
+def get_eco():
+    return app.state.eco
+
+@app.post("/api/config/eco")
+def post_eco(
+    sunny_kw: float = Body(...),
+    cloudy_kw: float = Body(...),
+):
+    app.state.eco["sunny_kw"] = float(sunny_kw)
+    app.state.eco["cloudy_kw"] = float(cloudy_kw)
+    return {"ok": True, **app.state.eco}
+
+@app.get("/")
+def root():
+    return {"ok": True, "msg": "EMS backend running"}
+
+# Startup-Loop
 @app.on_event("startup")
 async def on_start():
-    lat = float(os.getenv("LAT", "48.87"))   # Radldorf grob
+    lat = float(os.getenv("LAT", "48.87"))
     lon = float(os.getenv("LON", "12.65"))
     base_limit_kw = float(os.getenv("BASE_LIMIT_KW", "11"))
-    min_grid_kw = float(os.getenv("MIN_GRID_KW", "0.5"))
-    asyncio.create_task(control_loop(app, lat, lon, base_limit_kw, min_grid_kw))
+    asyncio.create_task(control_loop(app, lat, lon, base_limit_kw))
 
-# 8) Optional: statische Dateien
+# Statische Dateien optional
 if os.path.isdir("static"):
     app.mount("/", StaticFiles(directory="static", html=True), name="static")
