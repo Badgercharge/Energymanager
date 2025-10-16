@@ -1,6 +1,8 @@
+# backend/ocpp_cs.py
 import asyncio
 import logging
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 
 from ocpp.routing import on
 from ocpp.v16 import ChargePoint as CP, call_result, call
@@ -28,6 +30,10 @@ def _try_float(x):
     except Exception:
         return None
 
+def _round_to_0p1(x: float) -> float:
+    # Exakt auf 0,1 runden, um OCPP multipleOf 0.1 einzuhalten
+    return float(Decimal(str(x)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+
 class CentralSystem(CP):
     @on(Action.boot_notification)
     async def on_boot(self, charge_point_model, charge_point_vendor, **kwargs):
@@ -41,7 +47,7 @@ class CentralSystem(CP):
             status=RegistrationStatus.accepted,
         )
 
-        # Nachgelagerte Wunschkonfiguration (nicht blockierend)
+        # Wunsch-Konfiguration nach Boot (nicht blockierend)
         async def _post_boot_cfg():
             try:
                 await self.call(call.ChangeConfiguration(key="MeterValueSampleInterval", value="15"))
@@ -58,7 +64,7 @@ class CentralSystem(CP):
 
     @on(Action.authorize)
     async def on_authorize(self, id_tag, **kwargs):
-        # Einfache Demo: alle Tags akzeptieren
+        # Demo: alle Tags akzeptieren
         return call_result.Authorize(id_tag_info={"status": AuthorizationStatus.accepted})
 
     @on(Action.heartbeat)
@@ -137,6 +143,7 @@ class CentralSystem(CP):
                     except Exception:
                         pass
 
+                # "sampled_value" (snake) oder "sampledValue" (camel)
                 for sv in mv.get("sampled_value", []) or mv.get("sampledValue", []):
                     meas = (sv.get("measurand") or sv.get("measured_value") or "").lower()
                     unit = (sv.get("unit") or "").lower()
@@ -209,18 +216,22 @@ class CentralSystem(CP):
 
     @on(Action.set_charging_profile)
     async def on_set_profile(self, connector_id=None, cs_charging_profiles=None, charging_profile=None, **kwargs):
-        # Wird vom CS i. d. R. nicht benötigt; Simulator nutzt es.
+        # Simulator/Tests nutzen diesen Pfad; bestätige sauber.
         return call_result.SetChargingProfile(status="Accepted")
 
     async def push_charging_profile(self, target_kw: float):
-        """CS->CP: absolutes TxProfile mit Ampere-Limit passend zu target_kw."""
+        """
+        CS->CP: absolutes TxProfile mit Ampere-Limit passend zu target_kw.
+        limit wird auf 0,1 A gerundet, um das OCPP-Schema (multipleOf 0.1) zu erfüllen.
+        """
         st = STATE[self.id]
         target_kw = max(MIN_KW, min(MAX_KW, float(target_kw)))
-        amps = amps_from_kw(target_kw, st.phase_count, st.voltage_per_phase)
+        amps_raw = amps_from_kw(target_kw, st.phase_count, st.voltage_per_phase)
+        amps = _round_to_0p1(amps_raw)
 
         period = ChargingSchedulePeriod(start_period=0, limit=float(amps))
         try:
-            unit = ChargingRateUnitType.A  # wichtig: Großes "A"
+            unit = ChargingRateUnitType.A
         except Exception:
             unit = "A"
 
@@ -237,5 +248,5 @@ class CentralSystem(CP):
             charging_schedule=schedule,
         )
         req = call.SetChargingProfile(connector_id=1, cs_charging_profiles=profile)
-        logger.info("Set profile %s -> %.2f kW (%.1f A)", self.id, target_kw, amps)
+        logger.info("Set profile %s -> %.2f kW (%.1f A; raw=%.6f A)", self.id, target_kw, amps, amps_raw)
         return await self.call(req)
