@@ -13,16 +13,17 @@ async function fetchStats(){ const r=await fetch(`${API}/api/stats`); if(!r.ok) 
 async function fetchBoost(id){ const r=await fetch(`${API}/api/points/${id}/boost`); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
 async function saveBoost(id,data){ await fetch(`${API}/api/points/${id}/boost`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}) }
 async function fetchPrice(){ const r=await fetch(`${API}/api/price`); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
+async function fetchWeather(){ const r=await fetch(`${API}/api/weather`); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
 
 function ModeInfo(){
   return (
     <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm">
       <div className="px-4 py-3 border-b border-slate-100"><h3 className="text-sm font-semibold text-slate-800">Modi</h3></div>
       <div className="p-4 text-sm text-slate-600 space-y-2">
-        <p><strong>Eco</strong>: PV‑geführt (zwischen CLOUDY_KW und SUNNY_KW).</p>
-        <p><strong>Price</strong>: Preisgeführt im 15‑Min‑Raster. ≤ Median: {MAX_KW} kW, sonst {MIN_KW} kW. 100% SoC bis 07:00 wird zusätzlich abgesichert.</p>
-        <p><strong>Max</strong>: Konstant {MAX_KW} kW.</p>
-        <p><strong>Aus</strong>: Ziel {MIN_KW} kW (untere Grenze).</p>
+        <p><strong>Eco</strong>: PV‑geführt (zwischen CLOUDY_KW und SUNNY_KW) mit optionalem Boost bis Uhrzeit.</p>
+        <p><strong>Price</strong>: Preisgeführt im 15‑Min‑Raster. ≤ Median: {MAX_KW} kW, sonst {MIN_KW} kW. 100% bis 07:00 abgesichert.</p>
+        <p><strong>Max</strong>: Konstant {MAX_KW} kW. · <strong>Aus</strong>: {MIN_KW} kW Untergrenze.</p>
+        <p><strong>Manuell</strong>: Wird aktiv, wenn du „kW setzen“ verwendest; bleibt aktiv bis du wieder einen anderen Modus wählst.</p>
       </div>
     </div>
   )
@@ -86,6 +87,40 @@ function PricePanel(){
   )
 }
 
+function WeatherPanel(){
+  const [w,setW]=useState(null)
+  const [err,setErr]=useState(null)
+  const load=async()=>{ try{ setErr(null); setW(await fetchWeather()) } catch(e){ setErr(e.message||String(e)) } }
+  useEffect(()=>{ load(); const t=setInterval(load,60_000); return()=>clearInterval(t) },[])
+  if(err) return <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm p-4 text-sm text-red-600">Wetterfehler: {err}</div>
+  const d = w || {}
+  const t = d.temperature_c
+  const cc = d.cloud_cover_pct
+  const rad = d.shortwave_radiation_wm2
+  const wind = d.wind_speed_ms
+  const precip = d.precip_mm
+  const icon = precip>0.1 ? "🌧️" : (cc>=70 ? "☁️" : (cc>=30 ? "⛅" : "☀️"))
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm">
+      <div className="px-4 py-3 border-b border-slate-100"><h3 className="text-sm font-semibold text-slate-800">Wetter</h3></div>
+      <div className="p-4 text-sm flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className="text-xl">{icon}</span>
+          <div>
+            <div className="text-slate-700">{t!=null ? `${t.toFixed(1)} °C` : "—"}</div>
+            <div className="text-xs text-slate-500">{d.as_of ? new Date(d.as_of).toLocaleTimeString() : ""}</div>
+          </div>
+        </div>
+        <div className="text-right text-xs text-slate-600">
+          <div>Bewölkung: {cc!=null ? `${cc}%` : "—"}</div>
+          <div>Strahlung: {rad!=null ? `${rad} W/m²` : "—"}</div>
+          <div>Wind: {wind!=null ? `${wind.toFixed?.(1) ?? wind} m/s` : "—"}</div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function StatusBadge({status,error}){
   const s=(status||"").toLowerCase()
   let label="Unbekannt", cls="bg-slate-100 text-slate-700"
@@ -97,8 +132,8 @@ function StatusBadge({status,error}){
 }
 
 function BoostPanel({point,onSaved}){
-  if(point.mode==="price"){ 
-    return <div className="mt-3 text-xs text-slate-500">Price‑Modus: 100% bis 07:00 wird automatisch berücksichtigt.</div>
+  if(point.mode==="price" || point.mode==="manual"){ 
+    return <div className="mt-3 text-xs text-slate-500">Boost wird im aktuellen Modus nicht genutzt.</div>
   }
   const [enabled,setEnabled]=useState(false)
   const [cutoff,setCutoff]=useState("07:00")
@@ -166,7 +201,14 @@ export default function App(){
   useEffect(()=>{ load(); const t=setInterval(load,5000); return()=>clearInterval(t) },[])
 
   const doSetMode=async(id,mode)=>{ await setMode(id,mode); load() }
-  const doSetLimit=async(id)=>{ const kw=parseFloat(prompt(`Ziel kW (${MIN_KW}…${MAX_KW}):`)); if(!isNaN(kw)){ const v=Math.max(MIN_KW,Math.min(MAX_KW,kw)); await setLimit(id,v); load() } }
+  const doSetLimit=async(id)=>{
+    const kw=parseFloat(prompt(`Manuelles Ziel kW (${MIN_KW}…${MAX_KW}):`))
+    if(!isNaN(kw)){
+      const v=Math.max(MIN_KW,Math.min(MAX_KW,kw))
+      await setLimit(id,v)  // setzt Modus automatisch auf "manual"
+      load()
+    }
+  }
   const saveEcoCfg=async(d)=>{ await saveEco(d); await load() }
 
   return (
@@ -174,53 +216,4 @@ export default function App(){
       <header className="sticky top-0 z-10 border-b border-slate-200 bg-white/70 backdrop-blur-sm">
         <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
           <div className="flex items-center gap-2"><div className="w-2.5 h-2.5 rounded-full bg-emerald-500"/><h1 className="text-base font-semibold tracking-tight">Badger‑charge</h1></div>
-          <div className="text-xs text-slate-500">Backend: {API}</div>
-        </div>
-      </header>
-
-      <main className="max-w-5xl mx-auto px-4 py-6 space-y-6">
-        <ModeInfo />
-        <PricePanel />
-        <EcoSettings cfg={eco} onSave={saveEcoCfg}/>
-        <StatsPanel />
-
-        {loading && <div className="text-sm text-slate-500">Lade…</div>}
-        {error && <div className="text-sm text-red-600">Fehler: {error}</div>}
-
-        <div className="grid gap-4">
-          {points.map(p=>(
-            <div key={p.id} className="rounded-xl border border-slate-200 bg-white/80 shadow-sm p-4">
-              <div className="flex justify-between gap-4">
-                <div>
-                  <div className="font-semibold">{p.id}</div>
-                  <div className="flex items-center gap-2 text-sm">
-                    <StatusBadge status={p.cp_status} error={p.error_code}/>
-                    <span>· Modus: {p.mode}</span>
-                  </div>
-                  {p.current_soc!=null && <div className="text-xs text-slate-500">SoC: {p.current_soc}%</div>}
-                  {p.last_heartbeat && <div className="text-xs text-slate-500">Letzter Heartbeat: {String(p.last_heartbeat)}</div>}
-                </div>
-                <div className="text-right">
-                  <div className="text-2xl font-bold">{Number(p.target_kw||0).toFixed(2)} kW</div>
-                  <div className="text-xs text-slate-500">Ziel‑Leistung</div>
-                  <div className="mt-1 text-sm">Ist: <strong>{p.current_kw!=null ? Number(p.current_kw).toFixed(2) : "—"}</strong> kW</div>
-                </div>
-              </div>
-
-              <div className="mt-3 flex flex-wrap gap-2">
-                <button onClick={()=>doSetMode(p.id,"eco")} className="px-3 py-1 bg-emerald-600 text-white rounded">Eco</button>
-                <button onClick={()=>doSetMode(p.id,"price")} className="px-3 py-1 bg-cyan-700 text-white rounded">Price</button>
-                <button onClick={()=>doSetMode(p.id,"max")} className="px-3 py-1 bg-indigo-600 text-white rounded">Max</button>
-                <button onClick={()=>doSetMode(p.id,"off")} className="px-3 py-1 bg-slate-600 text-white rounded">Aus</button>
-                <button onClick={()=>doSetLimit(p.id)} className="px-3 py-1 bg-amber-600 text-white rounded">kW setzen</button>
-              </div>
-
-              <BoostPanel point={p} onSaved={load}/>
-            </div>
-          ))}
-          {points.length===0 && !loading && <div className="text-slate-500">Noch keine Wallbox verbunden…</div>}
-        </div>
-      </main>
-    </div>
-  )
-}
+          <div className="text-xs text-slate-
