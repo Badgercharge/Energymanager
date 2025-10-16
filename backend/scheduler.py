@@ -52,56 +52,57 @@ async def control_loop(app, lat: float, lon: float, base_limit_kw: float):
     battery_kwh = float(os.getenv("BATTERY_KWH", "60"))
     efficiency  = float(os.getenv("EFFICIENCY", "0.92"))
 
-    # Preis-Cache
-    prices_cache = {"ts": None, "series": [], "median": None}
+    # Preis-Cache im App-Status für das Frontend
+    app.state.pricing = {"as_of": None, "current_ct_per_kwh": None, "median_ct_per_kwh": None, "below_or_equal_median": None}
+
+    prices_cache = {"ts": None, "series": [], "median": None, "cur": None}
 
     while True:
         try:
             avg_wm2, _ = await fetch_radiation(lat, lon)
-            eco_cfg = app.state.eco  # {"sunny_kw":..., "cloudy_kw":...}
+            eco_cfg = app.state.eco
             eco_kw = clamp_kw(eco_kw_from_radiation(avg_wm2, eco_cfg["sunny_kw"], eco_cfg["cloudy_kw"]))
-            base_limit_kw = clamp_kw(base_limit_kw)  # doppelt gemoppelt
+            base_limit_kw = clamp_kw(base_limit_kw)
 
-            # Preise nur alle 10 Minuten aktualisieren
-            now = datetime.now(ZoneInfo(tzname)).astimezone()
-            if (prices_cache["ts"] is None) or ((now - prices_cache["ts"]).total_seconds() > 600):
-                series = await fetch_prices_ct_per_kwh(now.astimezone().replace(tzinfo=ZoneInfo("UTC")).astimezone())
+            # Preise alle 10 Minuten aktualisieren
+            now_local = datetime.now(ZoneInfo(tzname))
+            if (prices_cache["ts"] is None) or ((now_local - prices_cache["ts"]).total_seconds() > 600):
+                series = await fetch_prices_ct_per_kwh(now_local)
                 prices_cache["series"] = series
-                # Median über den lokalen Kalendertag
-                local_today = now.date()
-                today_prices = [p for ts, p in series if ts.astimezone(ZoneInfo(tzname)).date() == local_today]
+                today_prices = [p for ts, p in series if ts.astimezone(ZoneInfo(tzname)).date() == now_local.date()]
                 prices_cache["median"] = median(today_prices)
-                prices_cache["ts"] = now
+                prices_cache["ts"] = now_local
 
+            # aktuellen Preis bestimmen (letzter ts <= jetzt)
             cur_price = None
             if prices_cache["series"]:
-                # aktuellen 15-Minuten-Slot finden
-                now_utc = now.astimezone().astimezone().astimezone()
-                now_utc = now.astimezone().astimezone()
-                # robust: wähle den letzten ts <= now
-                candidates = [p for p in prices_cache["series"] if p[0] <= now.astimezone().astimezone()]
+                candidates = [p for p in prices_cache["series"] if p[0] <= now_local.astimezone(timezone.utc).replace(tzinfo=None)]
+                # Robustheits-Trick: wenn Zeitzonen-Verwirrung, fallback auf Maximum <= now_local in UTC
+                if not candidates:
+                    candidates = [p for p in prices_cache["series"] if p[0] <= datetime.utcnow()]
                 if candidates:
                     cur_price = candidates[-1][1]
+            prices_cache["cur"] = cur_price
+
+            # Frontend-Status setzen
+            app.state.pricing = {
+                "as_of": now_local.isoformat(),
+                "current_ct_per_kwh": cur_price,
+                "median_ct_per_kwh": prices_cache["median"],
+                "below_or_equal_median": (cur_price is not None and prices_cache["median"] is not None and cur_price <= prices_cache["median"]),
+            }
 
             for cp_id, st in STATE.items():
-                # Grundentscheidung
                 if st.mode == "off":
-                    target = MIN_KW  # technisch: 0 kW wäre sauber, aber Vorgabe min 3.7 -> wir setzen untere Grenze.
-                    # Hinweis: Wenn du bei "off" wirklich 0 A willst, sag Bescheid – wir senden dann 0 A Profil.
-
+                    target = MIN_KW  # minimale Grenze (wenn wirklich 0 A gewünscht, sag kurz Bescheid)
                 elif st.mode == "max":
                     target = MAX_KW
-
                 elif st.mode == "price":
-                    # Preisgesteuert: <= Median -> MAX_KW, sonst MIN_KW
+                    target = MIN_KW
                     if cur_price is not None and prices_cache["median"] is not None:
                         target = MAX_KW if cur_price <= prices_cache["median"] else MIN_KW
-                    else:
-                        # Fallback: wenn keine Preise, MIN
-                        target = MIN_KW
-                    # Zusätzlich SoC-Deadline 100% bis 07:00 sicherstellen
+                    # 100% bis 07:00 absichern
                     cutoff = next_dt("07:00", tzname)
-                    now_local = datetime.now(ZoneInfo(tzname))
                     hours_left = max(0.0, (cutoff - now_local).total_seconds() / 3600.0)
                     if hours_left > 0.0:
                         soc_now = float(st.current_soc if st.current_soc is not None else (st.soc or 0))
@@ -110,15 +111,11 @@ async def control_loop(app, lat: float, lon: float, base_limit_kw: float):
                         eff = max(0.5, min(1.0, efficiency))
                         req_kw = (need_kwh / hours_left) / eff if need_kwh > 0 else 0.0
                         target = max(target, req_kw)
-
-                else:  # "eco"
+                else:  # eco
                     target = eco_kw
-                    # Eco-Boost aktiv?
                     if st.boost_enabled:
                         cutoff = next_dt(st.boost_cutoff_local, tzname)
-                        now_local = datetime.now(ZoneInfo(tzname))
                         hours_left = max(0.0, (cutoff - now_local).total_seconds() / 3600.0)
-                        # Mail bei Ziel erreicht (einmalig)
                         if st.current_soc is not None and st.current_soc >= st.boost_target_soc and not st.boost_reached_notified:
                             st.boost_reached_notified = True
                             asyncio.create_task(send_mail(
@@ -139,7 +136,7 @@ async def control_loop(app, lat: float, lon: float, base_limit_kw: float):
                 if cp:
                     await cp.push_charging_profile(st.target_kw)
 
-            await asyncio.sleep(900)  # 15 Minuten
+            await asyncio.sleep(900)  # 15 min
         except Exception as e:
             log.exception("control loop error: %s", e)
             await asyncio.sleep(30)
