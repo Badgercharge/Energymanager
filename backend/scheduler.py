@@ -120,7 +120,7 @@ async def control_loop(app, lat: float, lon: float, base_limit_kw: float):
                     target = st.target_kw
 
                 elif st.mode == "off":
-                    target = MIN_KW  # wenn du 0 A möchtest, sag Bescheid
+                    target = 0  # wenn du 0 A möchtest, sag Bescheid
 
                 elif st.mode == "max":
                     target = MAX_KW
