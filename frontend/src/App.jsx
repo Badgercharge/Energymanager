@@ -216,4 +216,56 @@ export default function App(){
       <header className="sticky top-0 z-10 border-b border-slate-200 bg-white/70 backdrop-blur-sm">
         <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
           <div className="flex items-center gap-2"><div className="w-2.5 h-2.5 rounded-full bg-emerald-500"/><h1 className="text-base font-semibold tracking-tight">Badger‑charge</h1></div>
-          <div className="text-xs text-slate-
+          <div className="text-xs text-slate-500">Backend: {API}</div>
+        </div>
+      </header>
+
+      <main className="max-w-5xl mx-auto px-4 py-6 space-y-6">
+        <ModeInfo />
+        <div className="grid md:grid-cols-2 gap-4">
+          <PricePanel />
+          <WeatherPanel />
+        </div>
+        <EcoSettings cfg={eco} onSave={saveEcoCfg}/>
+        <StatsPanel />
+
+        {loading && <div className="text-sm text-slate-500">Lade…</div>}
+        {error && <div className="text-sm text-red-600">Fehler: {error}</div>}
+
+        <div className="grid gap-4">
+          {points.map(p=>(
+            <div key={p.id} className="rounded-xl border border-slate-200 bg-white/80 shadow-sm p-4">
+              <div className="flex justify-between gap-4">
+                <div>
+                  <div className="font-semibold">{p.id}</div>
+                  <div className="flex items-center gap-2 text-sm">
+                    <StatusBadge status={p.cp_status} error={p.error_code}/>
+                    <span>· Modus: {p.mode}</span>
+                  </div>
+                  {p.current_soc!=null && <div className="text-xs text-slate-500">SoC: {p.current_soc}%</div>}
+                  {p.last_heartbeat && <div className="text-xs text-slate-500">Letzter Heartbeat: {String(p.last_heartbeat)}</div>}
+                </div>
+                <div className="text-right">
+                  <div className="text-2xl font-bold">{Number(p.target_kw||0).toFixed(2)} kW</div>
+                  <div className="text-xs text-slate-500">Ziel‑Leistung</div>
+                  <div className="mt-1 text-sm">Ist: <strong>{p.current_kw!=null ? Number(p.current_kw).toFixed(2) : "—"}</strong> kW</div>
+                </div>
+              </div>
+
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button onClick={()=>doSetMode(p.id,"eco")} className="px-3 py-1 bg-emerald-600 text-white rounded">Eco</button>
+                <button onClick={()=>doSetMode(p.id,"price")} className="px-3 py-1 bg-cyan-700 text-white rounded">Price</button>
+                <button onClick={()=>doSetMode(p.id,"max")} className="px-3 py-1 bg-indigo-600 text-white rounded">Max</button>
+                <button onClick={()=>doSetMode(p.id,"off")} className="px-3 py-1 bg-slate-600 text-white rounded">Aus</button>
+                <button onClick={()=>doSetLimit(p.id)} className="px-3 py-1 bg-amber-600 text-white rounded">kW setzen (manuell)</button>
+              </div>
+
+              <BoostPanel point={p} onSaved={load}/>
+            </div>
+          ))}
+          {points.length===0 && !loading && <div className="text-slate-500">Noch keine Wallbox verbunden…</div>}
+        </div>
+      </main>
+    </div>
+  )
+}
