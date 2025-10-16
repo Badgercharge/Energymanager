@@ -3,7 +3,7 @@ import asyncio
 import aiohttp
 import logging
 import os
-from typing import Tuple
+from typing import Tuple, Dict
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -13,23 +13,27 @@ from price_provider import fetch_prices_ct_per_kwh, median
 
 log = logging.getLogger(__name__)
 
-# Feste Leistungsgrenzen (kW)
+# Fixed charger limits (kW)
 MIN_KW = 3.7
 MAX_KW = 11.0
 
-# Heuristik für Eco (Globalstrahlung W/m²)
+# Eco heuristic (global shortwave radiation W/m²)
 RAD_CLOUDY = 200.0
 RAD_SUNNY  = 650.0
 
+# Tuning knobs (can be overridden via env)
+LOOP_SECONDS            = int(os.getenv("CTRL_LOOP_SECONDS", "60"))     # main loop cadence
+PRICE_REFRESH_SECONDS   = int(os.getenv("PRICE_REFRESH_SECONDS", "300")) # 5 min
+WEATHER_REFRESH_SECONDS = int(os.getenv("WEATHER_REFRESH_SECONDS", "120")) # 2 min
+PUSH_DEADBAND_KW        = float(os.getenv("PUSH_DEADBAND_KW", "0.1"))   # only push profile if change >= this
 
 def clamp_kw(x: float) -> float:
     return max(MIN_KW, min(MAX_KW, float(x)))
 
-
 async def fetch_radiation(lat: float, lon: float) -> Tuple[float, float]:
     """
-    Holt aktuelle und nächste Stunde Kurzwelleneinstrahlung von Open-Meteo
-    und gibt den Mittelwert der beiden (avg) sowie den aktuellen Wert zurück.
+    Return (avg_next_hour, current) shortwave radiation (W/m²).
+    Uses Open‑Meteo hourly shortwave_radiation and approximates near-term avg.
     """
     url = (
         "https://api.open-meteo.com/v1/forecast"
@@ -52,10 +56,9 @@ async def fetch_radiation(lat: float, lon: float) -> Tuple[float, float]:
     avg = (cur + nxt) / 2.0
     return avg, cur
 
-
 def eco_kw_from_radiation(avg_wm2: float, sunny_kw: float, cloudy_kw: float) -> float:
     """
-    Linear zwischen CLOUDY_KW und SUNNY_KW interpolieren.
+    Linear interpolate between cloudy and sunny thresholds.
     """
     if avg_wm2 <= RAD_CLOUDY:
         return cloudy_kw
@@ -63,7 +66,6 @@ def eco_kw_from_radiation(avg_wm2: float, sunny_kw: float, cloudy_kw: float) -> 
         return sunny_kw
     t = (avg_wm2 - RAD_CLOUDY) / (RAD_SUNNY - RAD_CLOUDY)
     return cloudy_kw + t * (sunny_kw - cloudy_kw)
-
 
 def next_dt(local_hhmm: str, tzname: str) -> datetime:
     tz = ZoneInfo(tzname)
@@ -74,10 +76,17 @@ def next_dt(local_hhmm: str, tzname: str) -> datetime:
         cand += timedelta(days=1)
     return cand
 
+def seconds_to_next_quarter(now: datetime) -> int:
+    """
+    Returns seconds until the next 15‑minute boundary in local time.
+    """
+    minute = (now.minute // 15 + 1) * 15
+    next_q = now.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=minute)
+    return int((next_q - now).total_seconds())
 
 async def weather_loop(app, lat: float, lon: float, tzname: str):
     """
-    Aktualisiert alle 5 Minuten das aktuelle Wetter in app.state.weather.
+    Update current weather in app.state.weather frequently.
     """
     app.state.weather = {"as_of": None}
     url = (
@@ -102,25 +111,31 @@ async def weather_loop(app, lat: float, lon: float, tzname: str):
             }
         except Exception as e:
             log.warning("weather fetch failed: %s", e)
-        await asyncio.sleep(300)  # 5 Minuten
-
+        await asyncio.sleep(WEATHER_REFRESH_SECONDS)
 
 async def control_loop(app, lat: float, lon: float, base_limit_kw: float):
     """
-    Haupt-Regelschleife (alle 15 Minuten):
-    - Aktualisiert Preisstatus (current, median) für /api/price
-    - Berechnet Ziel-Leistung je Ladepunkt je nach Modus (manual > off/max/price/eco)
-    - Schätzt voraussichtliches Ende der Session (session_est_end_at) bei vorhandenem SoC
-    - Schiebt SetChargingProfile an die Wallbox
+    Dynamic control loop:
+    - Recomputes target every LOOP_SECONDS (default 60s)
+    - Refreshes prices at least every PRICE_REFRESH_SECONDS and at quarter boundaries
+    - Adjusts targets immediately when price/weather shift, pushes profiles only on meaningful changes
+    - Estimates session end time continuously
     """
     tzname = os.getenv("LOCAL_TZ", "Europe/Berlin")
     battery_kwh = float(os.getenv("BATTERY_KWH", "60"))
-    efficiency = float(os.getenv("EFFICIENCY", "0.92"))
+    efficiency  = float(os.getenv("EFFICIENCY", "0.92"))
 
-    # Preis-Cache
-    prices_cache = {"ts": None, "series": [], "median": None, "cur": None}
+    # Local state
+    prices_cache = {
+        "ts": None,            # last refresh local time
+        "series": [],          # [(utc_ts, ct/kWh)]
+        "median": None,        # today's median (local day)
+        "cur": None,           # current price (ct/kWh)
+        "next_update_after": 0 # monotonic seconds for cool‑down
+    }
+    last_push_kw: Dict[str, float] = {}   # last pushed target per CP
 
-    # Pricingobjekt initialisieren
+    # Initialize API state
     if not hasattr(app.state, "pricing"):
         app.state.pricing = {
             "as_of": None,
@@ -129,66 +144,87 @@ async def control_loop(app, lat: float, lon: float, base_limit_kw: float):
             "below_or_equal_median": None,
         }
 
+    async def refresh_prices(now_local: datetime, force=False):
+        need = False
+        if force:
+            need = True
+        elif prices_cache["ts"] is None:
+            need = True
+        elif (now_local - prices_cache["ts"]).total_seconds() >= PRICE_REFRESH_SECONDS:
+            need = True
+        else:
+            # additionally refresh shortly before/after quarter boundaries (±90s window)
+            s_to_next = seconds_to_next_quarter(now_local)
+            if s_to_next <= 90 or (900 - s_to_next) <= 90:
+                need = True
+
+        if not need:
+            return
+
+        series = await fetch_prices_ct_per_kwh(now_local)
+        prices_cache["series"] = series
+        prices_cache["ts"] = now_local
+
+        # compute current price and today's median in local tz
+        cur = None
+        if series:
+            now_utc = now_local.astimezone(timezone.utc)
+            for ts, price in series:
+                if ts <= now_utc:
+                    cur = price
+                else:
+                    break
+        today_vals = [p for ts, p in series if ts.astimezone(ZoneInfo(tzname)).date() == now_local.date()]
+        med = median(today_vals) if today_vals else None
+        prices_cache["cur"] = cur
+        prices_cache["median"] = med
+
+        app.state.pricing = {
+            "as_of": now_local.isoformat(),
+            "current_ct_per_kwh": cur,
+            "median_ct_per_kwh": med,
+            "below_or_equal_median": (cur is not None and med is not None and cur <= med),
+        }
+
     while True:
         try:
-            # Eco-Grundlage aus Globalstrahlung
-            avg_wm2, _ = await fetch_radiation(lat, lon)
+            now_local = datetime.now(ZoneInfo(tzname))
+
+            # 1) Weather → Eco target baseline
+            try:
+                avg_wm2, _ = await fetch_radiation(lat, lon)
+            except Exception as e:
+                log.warning("radiation fetch failed: %s", e)
+                avg_wm2 = RAD_CLOUDY
             eco_cfg = app.state.eco  # {"sunny_kw":..., "cloudy_kw":...}
             eco_kw = clamp_kw(eco_kw_from_radiation(avg_wm2, eco_cfg["sunny_kw"], eco_cfg["cloudy_kw"]))
             base_limit_kw = clamp_kw(base_limit_kw)
 
-            # Preise alle ~10 Minuten laden
-            now_local = datetime.now(ZoneInfo(tzname))
-            if (prices_cache["ts"] is None) or ((now_local - prices_cache["ts"]).total_seconds() > 600):
-                series = await fetch_prices_ct_per_kwh(now_local)
-                prices_cache["series"] = series
-                today_prices = [p for ts, p in series if ts.astimezone(ZoneInfo(tzname)).date() == now_local.date()]
-                prices_cache["median"] = median(today_prices)
-                prices_cache["ts"] = now_local
+            # 2) Prices
+            await refresh_prices(now_local)
 
-            # aktuellen Preis: letzter Punkt <= now_utc
-            cur_price = None
-            if prices_cache["series"]:
-                now_utc = now_local.astimezone(timezone.utc)
-                for ts, price in prices_cache["series"]:
-                    if ts <= now_utc:
-                        cur_price = price
-                    else:
-                        break
-            prices_cache["cur"] = cur_price
+            cur_price = prices_cache["cur"]
+            median_today = prices_cache["median"]
 
-            # API-Status für /api/price
-            app.state.pricing = {
-                "as_of": now_local.isoformat(),
-                "current_ct_per_kwh": cur_price,
-                "median_ct_per_kwh": prices_cache["median"],
-                "below_or_equal_median": (
-                    cur_price is not None
-                    and prices_cache["median"] is not None
-                    and cur_price <= prices_cache["median"]
-                ),
-            }
-
-            # Regelung je Ladepunkt
+            # 3) Per‑CP control
             for cp_id, st in STATE.items():
-                # 1) Ziel-Leistung je Modus (manual hat Vorrang)
+                # Compute target based on mode
                 if st.mode == "manual":
                     target = st.target_kw
 
                 elif st.mode == "off":
-                    # Untere Grenze – wenn du stattdessen 0 A willst, sag Bescheid.
-                    target = MIN_KW
+                    target = MIN_KW  # change to 0.0 if you want true stop
 
                 elif st.mode == "max":
                     target = MAX_KW
 
                 elif st.mode == "price":
-                    # Preisgesteuert: <= Median -> MAX, sonst MIN
-                    if cur_price is not None and prices_cache["median"] is not None:
-                        target = MAX_KW if cur_price <= prices_cache["median"] else MIN_KW
+                    # simple rule: <= median → MAX; else MIN
+                    if cur_price is not None and median_today is not None:
+                        target = MAX_KW if cur_price <= median_today else MIN_KW
                     else:
                         target = MIN_KW
-                    # 100% bis 07:00 absichern
+                    # ensure 100% by 07:00
                     cutoff = next_dt("07:00", tzname)
                     hours_left = max(0.0, (cutoff - now_local).total_seconds() / 3600.0)
                     if hours_left > 0.0:
@@ -199,20 +235,18 @@ async def control_loop(app, lat: float, lon: float, base_limit_kw: float):
                         req_kw = (need_kwh / hours_left) / eff if need_kwh > 0 else 0.0
                         target = max(target, req_kw)
 
-                else:  # "eco"
+                else:  # eco
                     target = eco_kw
                     if st.boost_enabled:
                         cutoff = next_dt(st.boost_cutoff_local, tzname)
                         hours_left = max(0.0, (cutoff - now_local).total_seconds() / 3600.0)
-                        # Ziel erreicht? E-Mail einmalig
+                        # reached target once? notify once
                         if st.current_soc is not None and st.current_soc >= st.boost_target_soc and not st.boost_reached_notified:
                             st.boost_reached_notified = True
-                            asyncio.create_task(
-                                send_mail(
-                                    f"[EMS] Ziel-SoC erreicht – {cp_id}",
-                                    f"Ladepunkt: {cp_id}\nSoC: {st.current_soc}% (Ziel {st.boost_target_soc}%)\nZeit: {fmt_ts()}\n",
-                                )
-                            )
+                            asyncio.create_task(send_mail(
+                                f"[EMS] Ziel-SoC erreicht – {cp_id}",
+                                f"Ladepunkt: {cp_id}\nSoC: {st.current_soc}% (Ziel {st.boost_target_soc}%)\nZeit: {fmt_ts()}\n"
+                            ))
                         if hours_left > 0.0:
                             soc_now = float(st.current_soc if st.current_soc is not None else (st.soc or 0))
                             need_soc = max(0.0, st.boost_target_soc - soc_now)
@@ -222,9 +256,10 @@ async def control_loop(app, lat: float, lon: float, base_limit_kw: float):
                             target = max(target, req_kw)
 
                 target = clamp_kw(target)
+                # Update state (this is what the UI shows as target)
                 st.target_kw = round(target, 2)
 
-                # 2) Prognose: voraussichtliches Ende (nur wenn Session aktiv und SoC bekannt)
+                # Estimate end time if we know SoC and session is active
                 st.session_est_end_at = None
                 if getattr(st, "tx_active", False) and (st.current_soc is not None):
                     target_soc = st.boost_target_soc if (st.mode == "eco" and st.boost_enabled) else 100
@@ -235,14 +270,25 @@ async def control_loop(app, lat: float, lon: float, base_limit_kw: float):
                         hours = need_kwh / (target * eff)
                         st.session_est_end_at = now_local + timedelta(hours=hours)
 
-                # 3) SetChargingProfile senden
-                cp = app.state.cps.get(cp_id)
-                if cp:
-                    await cp.push_charging_profile(st.target_kw)
+                # 4) Push SetChargingProfile only if changed enough
+                last = last_push_kw.get(cp_id)
+                if last is None or abs(st.target_kw - last) >= PUSH_DEADBAND_KW:
+                    cp = app.state.cps.get(cp_id)
+                    if cp:
+                        try:
+                            await cp.push_charging_profile(st.target_kw)
+                            last_push_kw[cp_id] = st.target_kw
+                        except Exception as e:
+                            log.warning("push profile %s failed: %s", cp_id, e)
 
-            # Haupt-Takt: 15 Minuten
-            await asyncio.sleep(900)
+            # 5) Sleep smartly: tighten around quarter boundaries
+            # Wake at least every LOOP_SECONDS, but if we are within 10s of a quarter boundary, shorten sleep.
+            sleep_s = LOOP_SECONDS
+            s_to_next = seconds_to_next_quarter(now_local)
+            if s_to_next <= 10 or (900 - s_to_next) <= 10:
+                sleep_s = min(sleep_s, 5)
+            await asyncio.sleep(max(1, sleep_s))
 
         except Exception as e:
             log.exception("control loop error: %s", e)
-            await asyncio.sleep(30)
+            await asyncio.sleep(10)
