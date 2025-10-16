@@ -4,6 +4,7 @@ const API = import.meta.env.VITE_API || window.location.origin
 const MIN_KW = 3.7
 const MAX_KW = 11.0
 
+// ---- API helpers ----
 async function fetchPoints(){ const r=await fetch(`${API}/api/points`); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
 async function fetchEco(){ const r=await fetch(`${API}/api/config/eco`); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
 async function saveEco(data){ const r=await fetch(`${API}/api/config/eco`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
@@ -15,14 +16,29 @@ async function saveBoost(id,data){ await fetch(`${API}/api/points/${id}/boost`,{
 async function fetchPrice(){ const r=await fetch(`${API}/api/price`); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
 async function fetchWeather(){ const r=await fetch(`${API}/api/weather`); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
 
+// ---- formatting helpers ----
+function fmtDT(s){
+  if(!s) return "—"
+  const d=new Date(s)
+  return d.toLocaleString()
+}
+function fmtTime(s){
+  if(!s) return "—"
+  const d=new Date(s)
+  return d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"})
+}
+
+// ---- UI components ----
 function ModeInfo(){
   return (
     <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm">
-      <div className="px-4 py-3 border-b border-slate-100"><h3 className="text-sm font-semibold text-slate-800">Modi</h3></div>
+      <div className="px-4 py-3 border-b border-slate-100">
+        <h3 className="text-sm font-semibold text-slate-800">Modi</h3>
+      </div>
       <div className="p-4 text-sm text-slate-600 space-y-2">
         <p><strong>Eco</strong>: PV‑geführt (zwischen CLOUDY_KW und SUNNY_KW) mit optionalem Boost bis Uhrzeit.</p>
         <p><strong>Price</strong>: Preisgeführt im 15‑Min‑Raster. ≤ Median: {MAX_KW} kW, sonst {MIN_KW} kW. 100% bis 07:00 abgesichert.</p>
-        <p><strong>Max</strong>: Konstant {MAX_KW} kW. · <strong>Aus</strong>: 0 kW </p>
+        <p><strong>Max</strong>: Konstant {MAX_KW} kW. · <strong>Aus</strong>: {MIN_KW} kW Untergrenze.</p>
         <p><strong>Manuell</strong>: Wird aktiv, wenn du „kW setzen“ verwendest; bleibt aktiv bis du wieder einen anderen Modus wählst.</p>
       </div>
     </div>
@@ -132,7 +148,7 @@ function StatusBadge({status,error}){
 }
 
 function BoostPanel({point,onSaved}){
-  if(point.mode==="price" || point.mode==="manual"){ 
+  if(point.mode==="price" || point.mode==="manual"){
     return <div className="mt-3 text-xs text-slate-500">Boost wird im aktuellen Modus nicht genutzt.</div>
   }
   const [enabled,setEnabled]=useState(false)
@@ -182,6 +198,7 @@ function StatsPanel(){
   )
 }
 
+// ---- App ----
 export default function App(){
   const [points,setPoints]=useState([])
   const [eco,setEco]=useState(null)
@@ -205,7 +222,7 @@ export default function App(){
     const kw=parseFloat(prompt(`Manuelles Ziel kW (${MIN_KW}…${MAX_KW}):`))
     if(!isNaN(kw)){
       const v=Math.max(MIN_KW,Math.min(MAX_KW,kw))
-      await setLimit(id,v)  // setzt Modus automatisch auf "manual"
+      await setLimit(id,v)  // setzt Modus automatisch auf "manual" im Backend
       load()
     }
   }
@@ -250,6 +267,14 @@ export default function App(){
                   <div className="text-xs text-slate-500">Ziel‑Leistung</div>
                   <div className="mt-1 text-sm">Ist: <strong>{p.current_kw!=null ? Number(p.current_kw).toFixed(2) : "—"}</strong> kW</div>
                 </div>
+              </div>
+
+              {/* Session-Infos */}
+              <div className="mt-3 text-xs text-slate-600 grid grid-cols-2 gap-2">
+                <div>Session-Start: <strong>{fmtDT(p.session_start_at)}</strong></div>
+                <div>Geladen (aktuell): <strong>{p.session_kwh!=null ? Number(p.session_kwh).toFixed(3) : "—"} kWh</strong></div>
+                <div>Vorauss. Ende: <strong>{fmtTime(p.session_est_end_at)}</strong></div>
+                <div>Transaktion aktiv: <strong>{p.tx_active ? "Ja" : "Nein"}</strong></div>
               </div>
 
               <div className="mt-3 flex flex-wrap gap-2">
