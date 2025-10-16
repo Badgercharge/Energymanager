@@ -4,43 +4,52 @@ from typing import List, Tuple
 
 log = logging.getLogger(__name__)
 
-"""
-Konfigurierbarer Preis-Provider:
-- PRICE_API_URL muss eine Liste von Preispunkten liefern (15-Minuten-Takt empfohlen).
-- Unterstützte Formate je Element (wir parsen flexibel):
-  { "start": ISO8601, "price_ct_per_kwh": float }
-  { "ts": ISO8601, "ct_per_kwh": float }
-  { "start": ISO8601, "price_eur_per_mwh": float }  # wird /10 umgerechnet zu ct/kWh
-Wir nehmen alle Punkte der letzten 24h bis +24h und bilden den Median aller Preise des heutigen Kalendertags (lokal).
-"""
+AWATTAR_DE = "https://api.awattar.de/v1/marketdata"
+
+def _to_dt_ms(ms: int) -> datetime:
+    # aWATTar liefert ms seit Epoche (UTC)
+    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
 
 async def fetch_prices_ct_per_kwh(now: datetime) -> List[Tuple[datetime, float]]:
-    url = os.getenv("PRICE_API_URL")
-    if not url:
-        # Kein Provider konfiguriert -> keine Preise
+    """
+    Holt Day-Ahead-Preise von aWATTar (DE), konvertiert zu ct/kWh
+    und expandiert Stundenpreise in 15-Minuten-Slots (flach).
+    Rückgabe: Liste[(ts_start, ct_per_kwh)] in UTC, auf +-36h um now begrenzt.
+    """
+    url = os.getenv("PRICE_API_URL", AWATTAR_DE)
+    params = {}  # aWATTar ohne Key, optional könnten time_from/time_to gesetzt werden
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, params=params, timeout=12) as r:
+                r.raise_for_status()
+                j = await r.json()
+    except Exception as e:
+        log.exception("price fetch failed: %s", e)
         return []
-    async with aiohttp.ClientSession() as s:
-        async with s.get(url, timeout=10) as r:
-            j = await r.json()
+
+    data = j.get("data") if isinstance(j, dict) else j
+    if not isinstance(data, list):
+        log.warning("unexpected price payload shape: %s", type(j))
+        return []
+
     out: List[Tuple[datetime, float]] = []
-    for item in j:
-        ts_str = item.get("start") or item.get("ts")
-        if not ts_str:
-            continue
+    for item in data:
+        # aWATTar Felder: start_timestamp, end_timestamp (ms), marketprice (EUR/MWh)
         try:
-            ts = datetime.fromisoformat(ts_str.replace("Z","+00:00"))
+            start = _to_dt_ms(int(item["start_timestamp"]))
+            end   = _to_dt_ms(int(item["end_timestamp"]))
+            eur_per_mwh = float(item["marketprice"])
+            ct_per_kwh = eur_per_mwh / 10.0  # 1 EUR/MWh = 0.1 ct/kWh
         except Exception:
             continue
-        if "price_ct_per_kwh" in item:
-            price = float(item["price_ct_per_kwh"])
-        elif "ct_per_kwh" in item:
-            price = float(item["ct_per_kwh"])
-        elif "price_eur_per_mwh" in item:
-            price = float(item["price_eur_per_mwh"]) / 10.0  # 1 EUR/MWh = 0.1 ct/kWh
-        else:
-            continue
-        out.append((ts.astimezone(timezone.utc), price))
-    # Sortieren und filtern auf +-36h um now
+
+        # Stundenpreis auf 15-Minuten-Slots verteilen: start, +15, +30, +45
+        slot = start
+        while slot < end:
+            out.append((slot, ct_per_kwh))
+            slot = slot + timedelta(minutes=15)
+
+    # sortieren und auf +-36h um now beschränken
     out.sort(key=lambda x: x[0])
     lo = now - timedelta(hours=36)
     hi = now + timedelta(hours=36)
@@ -52,7 +61,5 @@ def median(values: list[float]) -> float:
         return 0.0
     s = sorted(values)
     n = len(s)
-    mid = n // 2
-    if n % 2 == 1:
-        return s[mid]
-    return (s[mid-1] + s[mid]) / 2.0
+    m = n // 2
+    return s[m] if n % 2 == 1 else (s[m - 1] + s[m]) / 2.0
