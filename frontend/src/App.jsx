@@ -22,7 +22,7 @@ function ModeInfo(){
       <div className="p-4 text-sm text-slate-600 space-y-2">
         <p><strong>Eco</strong>: PV‑geführt (zwischen CLOUDY_KW und SUNNY_KW) mit optionalem Boost bis Uhrzeit.</p>
         <p><strong>Price</strong>: Preisgeführt im 15‑Min‑Raster. ≤ Median: {MAX_KW} kW, sonst {MIN_KW} kW. 100% bis 07:00 abgesichert.</p>
-        <p><strong>Max</strong>: Konstant {MAX_KW} kW. · <strong>Aus</strong>: 0 kW Untergrenze.</p>
+        <p><strong>Max</strong>: Konstant {MAX_KW} kW. · <strong>Aus</strong>: 0 kW </p>
         <p><strong>Manuell</strong>: Wird aktiv, wenn du „kW setzen“ verwendest; bleibt aktiv bis du wieder einen anderen Modus wählst.</p>
       </div>
     </div>
