@@ -12,14 +12,15 @@ async function setLimit(id,kw){ await fetch(`${API}/api/points/${id}/limit?kw=${
 async function fetchStats(){ const r=await fetch(`${API}/api/stats`); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
 async function fetchBoost(id){ const r=await fetch(`${API}/api/points/${id}/boost`); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
 async function saveBoost(id,data){ await fetch(`${API}/api/points/${id}/boost`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}) }
+async function fetchPrice(){ const r=await fetch(`${API}/api/price`); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
 
 function ModeInfo(){
   return (
     <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm">
       <div className="px-4 py-3 border-b border-slate-100"><h3 className="text-sm font-semibold text-slate-800">Modi</h3></div>
       <div className="p-4 text-sm text-slate-600 space-y-2">
-        <p><strong>Eco</strong>: PV‑geführt. Ladeleistung wird automatisch zwischen CLOUDY_KW und SUNNY_KW geregelt.</p>
-        <p><strong>Price</strong>: Preisgeführt im 15‑Minuten‑Takt. ≤ Median: {MAX_KW} kW, sonst {MIN_KW} kW. 100% SoC bis 07:00 wird zusätzlich sichergestellt.</p>
+        <p><strong>Eco</strong>: PV‑geführt (zwischen CLOUDY_KW und SUNNY_KW).</p>
+        <p><strong>Price</strong>: Preisgeführt im 15‑Min‑Raster. ≤ Median: {MAX_KW} kW, sonst {MIN_KW} kW. 100% SoC bis 07:00 wird zusätzlich abgesichert.</p>
         <p><strong>Max</strong>: Konstant {MAX_KW} kW.</p>
         <p><strong>Aus</strong>: Ziel {MIN_KW} kW (untere Grenze).</p>
       </div>
@@ -52,8 +53,41 @@ function EcoSettings({cfg,onSave}){
   )
 }
 
+function PricePanel(){
+  const [price,setPrice]=useState(null)
+  const [err,setErr]=useState(null)
+  const load=async()=>{ try{ setErr(null); setPrice(await fetchPrice()) } catch(e){ setErr(e.message||String(e)) } }
+  useEffect(()=>{ load(); const t=setInterval(load,60_000); return()=>clearInterval(t) },[])
+  if(err) return <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm p-4 text-sm text-red-600">Preisfehler: {err}</div>
+  const p = price || {}
+  const cur = p.current_ct_per_kwh
+  const med = p.median_ct_per_kwh
+  const below = p.below_or_equal_median
+  const badge = below===true ? {txt:"≤ Median", cls:"bg-emerald-100 text-emerald-700"} :
+                below===false ? {txt:"> Median", cls:"bg-red-100 text-red-700"} :
+                {txt:"n/a", cls:"bg-slate-100 text-slate-700"}
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm">
+      <div className="px-4 py-3 border-b border-slate-100"><h3 className="text-sm font-semibold text-slate-800">Aktueller Strompreis</h3></div>
+      <div className="p-4 flex items-center justify-between text-sm">
+        <div>
+          <div className="text-xs text-slate-500">as of</div>
+          <div className="text-slate-700">{p.as_of ? new Date(p.as_of).toLocaleString() : "—"}</div>
+        </div>
+        <div className="text-right">
+          <div className="text-xs text-slate-500">Preis / Median</div>
+          <div className="text-lg font-semibold">
+            {cur!=null ? cur.toFixed(2) : "—"} / {med!=null ? med.toFixed(2) : "—"} ct/kWh
+          </div>
+          <div className={`mt-1 inline-block px-2 py-0.5 rounded-full text-xs ${badge.cls}`}>{badge.txt}</div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function StatusBadge({status,error}){
-  const s = (status||"").toLowerCase()
+  const s=(status||"").toLowerCase()
   let label="Unbekannt", cls="bg-slate-100 text-slate-700"
   if(s==="available"){ label="Verfügbar"; cls="bg-emerald-100 text-emerald-700" }
   else if(s==="charging"){ label="Fahrzeug wird geladen"; cls="bg-indigo-100 text-indigo-700" }
@@ -63,7 +97,6 @@ function StatusBadge({status,error}){
 }
 
 function BoostPanel({point,onSaved}){
-  // Boost-Panel nur für Eco – im Price-Modus wird 100%@07:00 automatisch im Backend erzwungen
   if(point.mode==="price"){ 
     return <div className="mt-3 text-xs text-slate-500">Price‑Modus: 100% bis 07:00 wird automatisch berücksichtigt.</div>
   }
@@ -100,7 +133,7 @@ function StatsPanel(){
   useEffect(()=>{ load(); const t=setInterval(load,30000); return()=>clearInterval(t) },[])
   if(err) return <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm p-4 text-sm text-red-600">Fehler: {err}</div>
   if(!stats) return <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm p-4 text-sm text-slate-500">Lade Statistik…</div>
-  const total=stats.total||{}; const by7=stats.by_point?.["7d"]||{}; const by30=stats.by_point?.["30d"]||{}
+  const total=stats.total||{}
   return (
     <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm">
       <div className="px-4 py-3 border-b border-slate-100"><h3 className="text-sm font-semibold text-slate-800">Geladene Energie</h3></div>
@@ -147,6 +180,7 @@ export default function App(){
 
       <main className="max-w-5xl mx-auto px-4 py-6 space-y-6">
         <ModeInfo />
+        <PricePanel />
         <EcoSettings cfg={eco} onSave={saveEcoCfg}/>
         <StatsPanel />
 
@@ -168,7 +202,8 @@ export default function App(){
                 </div>
                 <div className="text-right">
                   <div className="text-2xl font-bold">{Number(p.target_kw||0).toFixed(2)} kW</div>
-                  <div className="text-xs text-slate-500">Ziel‑Ladeleistung</div>
+                  <div className="text-xs text-slate-500">Ziel‑Leistung</div>
+                  <div className="mt-1 text-sm">Ist: <strong>{p.current_kw!=null ? Number(p.current_kw).toFixed(2) : "—"}</strong> kW</div>
                 </div>
               </div>
 
