@@ -163,7 +163,7 @@ class CentralSystem(CP):
         amps = amps_from_kw(target_kw, st.phase_count, st.voltage_per_phase)
         period = ChargingSchedulePeriod(start_period=0, limit=amps)
         schedule = ChargingSchedule(
-            charging_rate_unit=ChargingRateUnitType.a,
+            charging_rate_unit=ChargingRateUnitType.A,
             charging_schedule_period=[period],
             duration=3600,
         )
