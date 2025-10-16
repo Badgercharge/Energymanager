@@ -1,6 +1,6 @@
 import asyncio, aiohttp, logging, os
 from typing import Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from models import STATE
@@ -47,62 +47,88 @@ def next_dt(local_hhmm: str, tzname: str) -> datetime:
     if cand <= now: cand += timedelta(days=1)
     return cand
 
+async def _update_pricing(app, tzname: str):
+    """
+    Holt Preise, ermittelt aktuellen Slot und Median für den lokalen Tag
+    und schreibt app.state.pricing. Nutzt aWATTar (stundenweise, auf PT15M expandiert)
+    oder ENTSO-E (PT15M), je nach Konfiguration in price_provider.py.
+    """
+    now_local = datetime.now(ZoneInfo(tzname))
+    now_utc = now_local.astimezone(timezone.utc)
+
+    series = await fetch_prices_ct_per_kwh(now_local)
+    if not series:
+        app.state.pricing = {
+            "as_of": now_local.isoformat(),
+            "current_ct_per_kwh": None,
+            "median_ct_per_kwh": None,
+            "below_or_equal_median": None,
+        }
+        log.warning("pricing: no price series available (check PRICE_API_URL or network)")
+        return
+
+    # aktueller Preis = letzter Punkt mit ts <= now_utc
+    cur_price = None
+    for ts, price in series:
+        if ts <= now_utc:
+            cur_price = price
+        else:
+            break
+
+    # Median über alle Punkte des lokalen Kalendertags
+    todays = [p for ts, p in series if ts.astimezone(ZoneInfo(tzname)).date() == now_local.date()]
+    med = median(todays) if todays else None
+
+    app.state.pricing = {
+        "as_of": now_local.isoformat(),
+        "current_ct_per_kwh": cur_price,
+        "median_ct_per_kwh": med,
+        "below_or_equal_median": (cur_price is not None and med is not None and cur_price <= med),
+    }
+
 async def control_loop(app, lat: float, lon: float, base_limit_kw: float):
     tzname = os.getenv("LOCAL_TZ", "Europe/Berlin")
     battery_kwh = float(os.getenv("BATTERY_KWH", "60"))
     efficiency  = float(os.getenv("EFFICIENCY", "0.92"))
 
-    # Preis-Cache im App-Status für das Frontend
-    app.state.pricing = {"as_of": None, "current_ct_per_kwh": None, "median_ct_per_kwh": None, "below_or_equal_median": None}
+    # Pricing-Objekt initialisieren und sofort befüllen
+    if not hasattr(app.state, "pricing"):
+        app.state.pricing = {"as_of": None, "current_ct_per_kwh": None, "median_ct_per_kwh": None, "below_or_equal_median": None}
+    await _update_pricing(app, tzname)
 
-    prices_cache = {"ts": None, "series": [], "median": None, "cur": None}
-
+    # Hauptschleife (alle 15 Minuten)
     while True:
         try:
+            # a) Wetter
             avg_wm2, _ = await fetch_radiation(lat, lon)
             eco_cfg = app.state.eco
             eco_kw = clamp_kw(eco_kw_from_radiation(avg_wm2, eco_cfg["sunny_kw"], eco_cfg["cloudy_kw"]))
             base_limit_kw = clamp_kw(base_limit_kw)
 
-            # Preise alle 10 Minuten aktualisieren
-            now_local = datetime.now(ZoneInfo(tzname))
-            if (prices_cache["ts"] is None) or ((now_local - prices_cache["ts"]).total_seconds() > 600):
-                series = await fetch_prices_ct_per_kwh(now_local)
-                prices_cache["series"] = series
-                today_prices = [p for ts, p in series if ts.astimezone(ZoneInfo(tzname)).date() == now_local.date()]
-                prices_cache["median"] = median(today_prices)
-                prices_cache["ts"] = now_local
+            # b) Preise: alle 5 Minuten refresh (damit median/current aktuell bleiben)
+            try:
+                await _update_pricing(app, tzname)
+            except Exception as e:
+                log.exception("pricing update failed: %s", e)
 
-            # aktuellen Preis bestimmen (letzter ts <= jetzt)
-            cur_price = None
-            if prices_cache["series"]:
-                candidates = [p for p in prices_cache["series"] if p[0] <= now_local.astimezone(timezone.utc).replace(tzinfo=None)]
-                # Robustheits-Trick: wenn Zeitzonen-Verwirrung, fallback auf Maximum <= now_local in UTC
-                if not candidates:
-                    candidates = [p for p in prices_cache["series"] if p[0] <= datetime.utcnow()]
-                if candidates:
-                    cur_price = candidates[-1][1]
-            prices_cache["cur"] = cur_price
+            cur_price = app.state.pricing.get("current_ct_per_kwh")
+            med_price = app.state.pricing.get("median_ct_per_kwh")
 
-            # Frontend-Status setzen
-            app.state.pricing = {
-                "as_of": now_local.isoformat(),
-                "current_ct_per_kwh": cur_price,
-                "median_ct_per_kwh": prices_cache["median"],
-                "below_or_equal_median": (cur_price is not None and prices_cache["median"] is not None and cur_price <= prices_cache["median"]),
-            }
-
+            # c) Regelung je Ladepunkt
             for cp_id, st in STATE.items():
                 if st.mode == "off":
-                    target = MIN_KW  # minimale Grenze (wenn wirklich 0 A gewünscht, sag kurz Bescheid)
+                    target = MIN_KW  # untere Grenze; wenn du 0 A willst, sag Bescheid.
                 elif st.mode == "max":
                     target = MAX_KW
                 elif st.mode == "price":
-                    target = MIN_KW
-                    if cur_price is not None and prices_cache["median"] is not None:
-                        target = MAX_KW if cur_price <= prices_cache["median"] else MIN_KW
-                    # 100% bis 07:00 absichern
+                    # Preisgesteuert: <= Median -> MAX, sonst MIN
+                    if cur_price is not None and med_price is not None:
+                        target = MAX_KW if cur_price <= med_price else MIN_KW
+                    else:
+                        target = MIN_KW
+                    # 100% bis 07:00 sicherstellen
                     cutoff = next_dt("07:00", tzname)
+                    now_local = datetime.now(ZoneInfo(tzname))
                     hours_left = max(0.0, (cutoff - now_local).total_seconds() / 3600.0)
                     if hours_left > 0.0:
                         soc_now = float(st.current_soc if st.current_soc is not None else (st.soc or 0))
@@ -115,6 +141,7 @@ async def control_loop(app, lat: float, lon: float, base_limit_kw: float):
                     target = eco_kw
                     if st.boost_enabled:
                         cutoff = next_dt(st.boost_cutoff_local, tzname)
+                        now_local = datetime.now(ZoneInfo(tzname))
                         hours_left = max(0.0, (cutoff - now_local).total_seconds() / 3600.0)
                         if st.current_soc is not None and st.current_soc >= st.boost_target_soc and not st.boost_reached_notified:
                             st.boost_reached_notified = True
@@ -136,7 +163,9 @@ async def control_loop(app, lat: float, lon: float, base_limit_kw: float):
                 if cp:
                     await cp.push_charging_profile(st.target_kw)
 
-            await asyncio.sleep(900)  # 15 min
+            # Wartezeit: 15 Minuten
+            await asyncio.sleep(900)
+
         except Exception as e:
             log.exception("control loop error: %s", e)
             await asyncio.sleep(30)
