@@ -1,21 +1,29 @@
-import asyncio, logging, os
+import asyncio
+import logging
+import os
 from datetime import datetime, timedelta, timezone
+
 from fastapi import FastAPI, WebSocket, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 
 from ocpp_cs import CentralSystem
-from models import STATE, ENERGY_LOGS
+from models import STATE, ENERGY_LOGS, ChargePointState
 from scheduler import control_loop, weather_loop
 from mailer import send_mail, fmt_ts
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 app = FastAPI()
 
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").split(",")
-app.add_middleware(CORSMiddleware, allow_origins=ALLOW_ORIGINS, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOW_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.state.cps = {}
 app.state.eco = {
@@ -56,48 +64,46 @@ def list_points():
 @app.post("/api/points/{cp_id}/mode/{mode}")
 def set_mode(cp_id: str, mode: str):
     assert mode in ["eco", "max", "off", "price", "manual"]
-    if cp_id not in STATE:
-        from models import ChargePointState
-        STATE[cp_id] = ChargePointState(id=cp_id)
-    STATE[cp_id].mode = mode
-    return {"ok": True}
+    s = STATE.get(cp_id) or ChargePointState(id=cp_id)
+    s.mode = mode
+    STATE[cp_id] = s
+    return {"ok": True, "mode": mode}
 
 @app.post("/api/points/{cp_id}/limit")
 def set_limit(cp_id: str, kw: float):
-    if cp_id not in STATE:
-        from models import ChargePointState
-        STATE[cp_id] = ChargePointState(id=cp_id)
+    s = STATE.get(cp_id) or ChargePointState(id=cp_id)
     kw = max(3.7, min(11.0, float(kw)))
-    s = STATE[cp_id]
     s.target_kw = kw
-    s.mode = "manual"  # NEU: manueller Modus erzwingen
+    s.mode = "manual"
+    STATE[cp_id] = s
     cp = app.state.cps.get(cp_id)
     if cp:
         asyncio.create_task(cp.push_charging_profile(kw))
     return {"ok": True, "kw": kw, "mode": s.mode}
 
-# Boost Eco unverändert
 @app.get("/api/points/{cp_id}/boost")
 def get_boost(cp_id: str):
     s = STATE.get(cp_id)
-    if not s: return {"enabled": False}
+    if not s:
+        return {"enabled": False}
     return {"enabled": s.boost_enabled, "cutoff_local": s.boost_cutoff_local, "target_soc": s.boost_target_soc}
 
 @app.post("/api/points/{cp_id}/boost")
 def set_boost(cp_id: str, enabled: bool = Body(...), cutoff_local: str = Body(..., embed=True), target_soc: int = Body(...)):
-    from models import ChargePointState
     s = STATE.get(cp_id) or ChargePointState(id=cp_id)
     s.boost_enabled = bool(enabled)
     s.boost_cutoff_local = cutoff_local
     s.boost_target_soc = int(target_soc)
     s.boost_reached_notified = False
     STATE[cp_id] = s
-    if s.mode == "off": s.mode = "eco"
+    if s.mode in ["off", "max"]:
+        # Boost greift in Eco/Price. Wir lassen den Modus unverändert, Anzeige erfolgt im Frontend kontextbezogen.
+        pass
     return {"ok": True}
 
-# Eco-Config
 @app.get("/api/config/eco")
-def get_eco(): return app.state.eco
+def get_eco():
+    return app.state.eco
 
 @app.post("/api/config/eco")
 def post_eco(sunny_kw: float = Body(...), cloudy_kw: float = Body(...)):
@@ -105,24 +111,26 @@ def post_eco(sunny_kw: float = Body(...), cloudy_kw: float = Body(...)):
     app.state.eco["cloudy_kw"] = max(3.7, min(11.0, float(cloudy_kw)))
     return {"ok": True, **app.state.eco}
 
-# Preise/Wetter
 @app.get("/api/price")
-def get_price(): return app.state.pricing
+def get_price():
+    return app.state.pricing
 
 @app.get("/api/weather")
-def get_weather(): return app.state.weather
+def get_weather():
+    return app.state.weather
 
-# Statistik (unverändert)
 def _sum_range(points, days):
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=days)
     total = 0.0
     for _, rows in points.items():
-        if not rows: continue
+        if not rows:
+            continue
         first = None; last = None
         for ts, kwh in rows:
             if ts >= since:
-                if first is None: first = kwh
+                if first is None:
+                    first = kwh
                 last = kwh
         if first is not None and last is not None:
             total += max(0.0, last - first)
@@ -136,7 +144,8 @@ def _per_cp(points, days):
         first = None; last = None
         for ts, kwh in rows:
             if ts >= since:
-                if first is None: first = kwh
+                if first is None:
+                    first = kwh
                 last = kwh
         out[cp_id] = round(max(0.0, (last - first) if (first is not None and last is not None) else 0.0), 2)
     return out
@@ -150,7 +159,8 @@ def stats():
     }
 
 @app.get("/")
-def root(): return {"ok": True, "msg": "EMS backend running"}
+def root():
+    return {"ok": True, "msg": "EMS backend running"}
 
 @app.on_event("startup")
 async def on_start():
@@ -159,8 +169,4 @@ async def on_start():
     base_limit_kw = float(os.getenv("BASE_LIMIT_KW", "11"))
     tz = os.getenv("LOCAL_TZ", "Europe/Berlin")
     asyncio.create_task(control_loop(app, lat, lon, base_limit_kw))
-    asyncio.create_task(weather_loop(app, lat, lon, tz))  # NEU: Wetter-Task
-
-# Kein Root-Static-Mount, um /api/* nicht zu überdecken
-# if os.path.isdir("static"):
-#     app.mount("/ui", StaticFiles(directory="static", html=True), name="static")
+    asyncio.create_task(weather_loop(app, lat, lon, tz))
