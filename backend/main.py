@@ -155,5 +155,3 @@ async def on_start():
     base_limit_kw = float(os.getenv("BASE_LIMIT_KW", "11"))
     asyncio.create_task(control_loop(app, lat, lon, base_limit_kw))
 
-if os.path.isdir("static"):
-    app.mount("/", StaticFiles(directory="static", html=True), name="static")
