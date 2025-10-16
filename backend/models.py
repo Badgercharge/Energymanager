@@ -11,25 +11,30 @@ class ChargePointState:
     last_heartbeat: Optional[datetime] = None
     mode: Mode = "eco"
     target_kw: float = 0.0
+
+    # elektrische Parameter (für A-Berechnung im Profil)
     phase_count: int = 3
     voltage_per_phase: float = 230.0
     max_current_a: float = 16.0
 
-    # Betriebsstatus aus StatusNotification (Available/Charging/Faulted...)
-    cp_status: Optional[str] = None
-    error_code: Optional[str] = None
+    # Status laut StatusNotification
+    cp_status: Optional[str] = None   # Available / Charging / Faulted ...
+    error_code: Optional[str] = None  # Fault-Code, falls vorhanden
 
-    # SoC
+    # SoC (nur read-only via OCPP)
     soc: Optional[int] = None
     current_soc: Optional[int] = None
 
-    # Eco-Boost (Standard bei Session-Start: 100% bis 07:00)
+    # Aktuelle Ladeleistung (Ist), kW – aus MeterValues abgeleitet
+    current_kw: Optional[float] = None
+
+    # Eco-Boost Standard (100% bis 07:00 bei Session-Start)
     boost_enabled: bool = False
-    boost_cutoff_local: str = "07:00"  # HH:MM
+    boost_cutoff_local: str = "07:00"
     boost_target_soc: int = 100
     boost_reached_notified: bool = False
 
-    # Energie / Statistik (kumul. Register kWh)
+    # Energie‑Register insgesamt (kWh)
     energy_kwh_total: Optional[float] = None
 
 STATE: Dict[str, ChargePointState] = {}
