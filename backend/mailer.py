@@ -1,4 +1,4 @@
-import aiosmtplib, asyncio, os, logging
+import aiosmtplib, os, logging
 from email.message import EmailMessage
 from datetime import datetime, timezone
 
@@ -20,15 +20,12 @@ async def send_mail(subject: str, body: str):
     msg["To"] = MAIL_TO
     msg["Subject"] = subject
     msg.set_content(body)
-    try:
-        await aiosmtplib.send(
-            msg, hostname=SMTP_HOST, port=SMTP_PORT,
-            username=SMTP_USER, password=SMTP_PASS, start_tls=True, timeout=10
-        )
-        log.info("Email sent: %s", subject)
-    except Exception as e:
-        log.exception("Email send failed: %s", e)
+    await aiosmtplib.send(
+        msg, hostname=SMTP_HOST, port=SMTP_PORT,
+        username=SMTP_USER, password=SMTP_PASS, start_tls=True, timeout=10
+    )
+    log.info("Email sent: %s", subject)
 
-def fmt_ts(ts: datetime | None = None):
+def fmt_ts(ts=None):
     ts = ts or datetime.now(timezone.utc)
     return ts.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
