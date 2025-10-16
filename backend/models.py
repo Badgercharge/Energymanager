@@ -2,7 +2,7 @@ from typing import Dict, Optional, Literal, List, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 
-Mode = Literal["eco", "max", "off", "price"]
+Mode = Literal["eco", "max", "off", "price", "manual"]  # manual ergänzt
 
 @dataclass
 class ChargePointState:
@@ -12,32 +12,23 @@ class ChargePointState:
     mode: Mode = "eco"
     target_kw: float = 0.0
 
-    # elektrische Parameter (für A-Berechnung im Profil)
     phase_count: int = 3
     voltage_per_phase: float = 230.0
     max_current_a: float = 16.0
 
-    # Status laut StatusNotification
-    cp_status: Optional[str] = None   # Available / Charging / Faulted ...
-    error_code: Optional[str] = None  # Fault-Code, falls vorhanden
+    cp_status: Optional[str] = None
+    error_code: Optional[str] = None
 
-    # SoC (nur read-only via OCPP)
     soc: Optional[int] = None
     current_soc: Optional[int] = None
-
-    # Aktuelle Ladeleistung (Ist), kW – aus MeterValues abgeleitet
     current_kw: Optional[float] = None
 
-    # Eco-Boost Standard (100% bis 07:00 bei Session-Start)
     boost_enabled: bool = False
     boost_cutoff_local: str = "07:00"
     boost_target_soc: int = 100
     boost_reached_notified: bool = False
 
-    # Energie‑Register insgesamt (kWh)
     energy_kwh_total: Optional[float] = None
 
 STATE: Dict[str, ChargePointState] = {}
-
-# Energie-Logs: cp_id -> Liste[(timestamp, kwh_total)]
 ENERGY_LOGS: Dict[str, List[Tuple[datetime, float]]] = {}
