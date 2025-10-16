@@ -14,18 +14,16 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 
-# CORS
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").split(",")
 app.add_middleware(CORSMiddleware, allow_origins=ALLOW_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 
-# Zustand
 app.state.cps = {}
 app.state.eco = {
     "sunny_kw": max(3.7, min(11.0, float(os.getenv("SUNNY_KW", "11.0")))),
     "cloudy_kw": max(3.7, min(11.0, float(os.getenv("CLOUDY_KW", "3.7")))),
 }
+app.state.pricing = {"as_of": None, "current_ct_per_kwh": None, "median_ct_per_kwh": None, "below_or_equal_median": None}
 
-# WebSocket Adapter
 class FastAPIWebSocketAdapter:
     def __init__(self, ws: WebSocket): self.ws = ws
     async def recv(self) -> str: return await self.ws.receive_text()
@@ -50,7 +48,7 @@ async def ocpp(ws: WebSocket, cp_id: str):
             STATE[cp_id].connected = False
         app.state.cps.pop(cp_id, None)
 
-# API: Punkte
+# Punkte
 @app.get("/api/points")
 def list_points():
     return [vars(s) for s in STATE.values()]
@@ -76,12 +74,7 @@ def set_limit(cp_id: str, kw: float):
         asyncio.create_task(cp.push_charging_profile(kw))
     return {"ok": True, "kw": kw}
 
-# SoC manuell – deaktiviert (nur OCPP), erhalten für Kompatibilität -> 405-ähnlich
-@app.post("/api/points/{cp_id}/soc")
-def set_soc_disabled(cp_id: str):
-    return {"ok": False, "error": "SoC ist nur read-only (OCPP)."}
-
-# Boost (Eco) – weiterhin konfigurierbar (nur Eco nutzt es)
+# Boost Eco
 @app.get("/api/points/{cp_id}/boost")
 def get_boost(cp_id: str):
     s = STATE.get(cp_id)
@@ -100,7 +93,7 @@ def set_boost(cp_id: str, enabled: bool = Body(...), cutoff_local: str = Body(..
     if s.mode == "off": s.mode = "eco"
     return {"ok": True}
 
-# Eco-Config (nur sunny/cloudy, strikt geklemmt)
+# Eco-Config
 @app.get("/api/config/eco")
 def get_eco(): return app.state.eco
 
@@ -110,12 +103,17 @@ def post_eco(sunny_kw: float = Body(...), cloudy_kw: float = Body(...)):
     app.state.eco["cloudy_kw"] = max(3.7, min(11.0, float(cloudy_kw)))
     return {"ok": True, **app.state.eco}
 
-# Statistik kWh (wie zuvor)
+# Preise für Frontend
+@app.get("/api/price")
+def get_price():
+    return app.state.pricing
+
+# Statistik (kWh)
 def _sum_range(points, days):
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=days)
     total = 0.0
-    for cp_id, rows in points.items():
+    for _, rows in points.items():
         if not rows: continue
         first = None; last = None
         for ts, kwh in rows:
