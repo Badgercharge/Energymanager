@@ -14,13 +14,15 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 app = FastAPI()
 
+# CORS
 ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").split(",")
 app.add_middleware(CORSMiddleware, allow_origins=ALLOW_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 
+# Zustand
 app.state.cps = {}
 app.state.eco = {
-    "sunny_kw": float(os.getenv("SUNNY_KW", "11.0")),
-    "cloudy_kw": float(os.getenv("CLOUDY_KW", "3.7")),
+    "sunny_kw": max(3.7, min(11.0, float(os.getenv("SUNNY_KW", "11.0")))),
+    "cloudy_kw": max(3.7, min(11.0, float(os.getenv("CLOUDY_KW", "3.7")))),
 }
 
 # WebSocket Adapter
@@ -40,9 +42,7 @@ async def ocpp(ws: WebSocket, cp_id: str):
         await cp.start()
     except Exception as e:
         logging.exception("WS error %s: %s", cp_id, e)
-        subj = f"[EMS] Backend-Fehler OCPP WS – {cp_id}"
-        body = f"Ladepunkt: {cp_id}\nZeit: {fmt_ts()}\nFehler: {repr(e)}"
-        asyncio.create_task(send_mail(subj, body))
+        asyncio.create_task(send_mail(f"[EMS] Backend-Fehler OCPP WS – {cp_id}", f"Ladepunkt: {cp_id}\nZeit: {fmt_ts()}\nFehler: {repr(e)}"))
         raise
     finally:
         logging.info("WS disconnected: %s", cp_id)
@@ -50,14 +50,14 @@ async def ocpp(ws: WebSocket, cp_id: str):
             STATE[cp_id].connected = False
         app.state.cps.pop(cp_id, None)
 
-# REST: Points
+# API: Punkte
 @app.get("/api/points")
 def list_points():
     return [vars(s) for s in STATE.values()]
 
 @app.post("/api/points/{cp_id}/mode/{mode}")
 def set_mode(cp_id: str, mode: str):
-    assert mode in ["eco", "max", "off"]
+    assert mode in ["eco", "max", "off", "price"]
     if cp_id not in STATE:
         from models import ChargePointState
         STATE[cp_id] = ChargePointState(id=cp_id)
@@ -69,24 +69,19 @@ def set_limit(cp_id: str, kw: float):
     if cp_id not in STATE:
         from models import ChargePointState
         STATE[cp_id] = ChargePointState(id=cp_id)
+    kw = max(3.7, min(11.0, float(kw)))
     STATE[cp_id].target_kw = kw
-    # Optional: sofort pushen? -> wenn OCPP-Session aktiv, man kann hier push auslösen
     cp = app.state.cps.get(cp_id)
     if cp:
         asyncio.create_task(cp.push_charging_profile(kw))
-    return {"ok": True}
+    return {"ok": True, "kw": kw}
 
-# SoC manuell
+# SoC manuell – deaktiviert (nur OCPP), erhalten für Kompatibilität -> 405-ähnlich
 @app.post("/api/points/{cp_id}/soc")
-def set_soc(cp_id: str, soc: int = Body(..., embed=True)):
-    if cp_id not in STATE:
-        from models import ChargePointState
-        STATE[cp_id] = ChargePointState(id=cp_id)
-    STATE[cp_id].current_soc = int(soc)
-    STATE[cp_id].soc = int(soc)
-    return {"ok": True}
+def set_soc_disabled(cp_id: str):
+    return {"ok": False, "error": "SoC ist nur read-only (OCPP)."}
 
-# Boost (Eco)
+# Boost (Eco) – weiterhin konfigurierbar (nur Eco nutzt es)
 @app.get("/api/points/{cp_id}/boost")
 def get_boost(cp_id: str):
     s = STATE.get(cp_id)
@@ -100,67 +95,56 @@ def set_boost(cp_id: str, enabled: bool = Body(...), cutoff_local: str = Body(..
     s.boost_enabled = bool(enabled)
     s.boost_cutoff_local = cutoff_local
     s.boost_target_soc = int(target_soc)
-    if not enabled:
-        s.boost_reached_notified = False
+    s.boost_reached_notified = False
     STATE[cp_id] = s
     if s.mode == "off": s.mode = "eco"
     return {"ok": True}
 
-# Eco-Config
+# Eco-Config (nur sunny/cloudy, strikt geklemmt)
 @app.get("/api/config/eco")
 def get_eco(): return app.state.eco
 
 @app.post("/api/config/eco")
 def post_eco(sunny_kw: float = Body(...), cloudy_kw: float = Body(...)):
-    app.state.eco["sunny_kw"] = float(sunny_kw)
-    app.state.eco["cloudy_kw"] = float(cloudy_kw)
+    app.state.eco["sunny_kw"] = max(3.7, min(11.0, float(sunny_kw)))
+    app.state.eco["cloudy_kw"] = max(3.7, min(11.0, float(cloudy_kw)))
     return {"ok": True, **app.state.eco}
 
-# Statistik: kWh letzte 7 / 30 Tage (gesamt + pro Lader)
-def _sum_range_kwh(points):
+# Statistik kWh (wie zuvor)
+def _sum_range(points, days):
     now = datetime.now(timezone.utc)
-    out = {"7d": 0.0, "30d": 0.0}
-    for days in (7, 30):
-        since = now - timedelta(days=days)
-        total = 0.0
-        for cp_id, rows in points.items():
-            if not rows: continue
-            # nehme min/max innerhalb des Fensters (Register ist kumulativ)
-            first = None
-            last  = None
-            for ts, kwh in rows:
-                if ts >= since:
-                    if first is None: first = kwh
-                    last = kwh
-            if first is not None and last is not None:
-                total += max(0.0, last - first)
-        out[f"{days}d"] = round(total, 2)
-    return out
+    since = now - timedelta(days=days)
+    total = 0.0
+    for cp_id, rows in points.items():
+        if not rows: continue
+        first = None; last = None
+        for ts, kwh in rows:
+            if ts >= since:
+                if first is None: first = kwh
+                last = kwh
+        if first is not None and last is not None:
+            total += max(0.0, last - first)
+    return round(total, 2)
 
-def _sum_range_kwh_per_cp(points):
+def _per_cp(points, days):
     now = datetime.now(timezone.utc)
+    since = now - timedelta(days=days)
     out = {}
     for cp_id, rows in points.items():
-        res = {"7d": 0.0, "30d": 0.0}
-        for days in (7, 30):
-            since = now - timedelta(days=days)
-            first = None; last = None
-            for ts, kwh in rows:
-                if ts >= since:
-                    if first is None: first = kwh
-                    last = kwh
-            if first is not None and last is not None:
-                res[f"{days}d"] = round(max(0.0, last - first), 2)
-        out[cp_id] = res
+        first = None; last = None
+        for ts, kwh in rows:
+            if ts >= since:
+                if first is None: first = kwh
+                last = kwh
+        out[cp_id] = round(max(0.0, (last - first) if (first is not None and last is not None) else 0.0), 2)
     return out
 
 @app.get("/api/stats")
 def stats():
-    # Hinweis: In-Memory; geht bei Restart verloren
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "total": _sum_range_kwh(ENERGY_LOGS),
-        "by_point": _sum_range_kwh_per_cp(ENERGY_LOGS),
+        "total": {"7d": _sum_range(ENERGY_LOGS,7), "30d": _sum_range(ENERGY_LOGS,30)},
+        "by_point": {"7d": _per_cp(ENERGY_LOGS,7), "30d": _per_cp(ENERGY_LOGS,30)},
     }
 
 @app.get("/")
