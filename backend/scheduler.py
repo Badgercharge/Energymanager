@@ -2,15 +2,20 @@ import asyncio, aiohttp, logging, os
 from typing import Tuple
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
 from models import STATE
 from mailer import send_mail, fmt_ts
+from price_provider import fetch_prices_ct_per_kwh, median
 
 log = logging.getLogger(__name__)
 
+MIN_KW = 3.7
+MAX_KW = 11.0
 RAD_CLOUDY = 200.0
 RAD_SUNNY  = 650.0
 
-def clamp(x, lo, hi): return max(lo, min(hi, x))
+def clamp_kw(x: float) -> float:
+    return max(MIN_KW, min(MAX_KW, x))
 
 async def fetch_radiation(lat: float, lon: float) -> Tuple[float, float]:
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=shortwave_radiation&forecast_days=1&timezone=auto"
@@ -47,36 +52,79 @@ async def control_loop(app, lat: float, lon: float, base_limit_kw: float):
     battery_kwh = float(os.getenv("BATTERY_KWH", "60"))
     efficiency  = float(os.getenv("EFFICIENCY", "0.92"))
 
+    # Preis-Cache
+    prices_cache = {"ts": None, "series": [], "median": None}
+
     while True:
         try:
             avg_wm2, _ = await fetch_radiation(lat, lon)
-            eco_cfg = app.state.eco
-            eco_kw = clamp(eco_kw_from_radiation(avg_wm2, eco_cfg["sunny_kw"], eco_cfg["cloudy_kw"]), 0.0, base_limit_kw)
+            eco_cfg = app.state.eco  # {"sunny_kw":..., "cloudy_kw":...}
+            eco_kw = clamp_kw(eco_kw_from_radiation(avg_wm2, eco_cfg["sunny_kw"], eco_cfg["cloudy_kw"]))
+            base_limit_kw = clamp_kw(base_limit_kw)  # doppelt gemoppelt
+
+            # Preise nur alle 10 Minuten aktualisieren
+            now = datetime.now(ZoneInfo(tzname)).astimezone()
+            if (prices_cache["ts"] is None) or ((now - prices_cache["ts"]).total_seconds() > 600):
+                series = await fetch_prices_ct_per_kwh(now.astimezone().replace(tzinfo=ZoneInfo("UTC")).astimezone())
+                prices_cache["series"] = series
+                # Median über den lokalen Kalendertag
+                local_today = now.date()
+                today_prices = [p for ts, p in series if ts.astimezone(ZoneInfo(tzname)).date() == local_today]
+                prices_cache["median"] = median(today_prices)
+                prices_cache["ts"] = now
+
+            cur_price = None
+            if prices_cache["series"]:
+                # aktuellen 15-Minuten-Slot finden
+                now_utc = now.astimezone().astimezone().astimezone()
+                now_utc = now.astimezone().astimezone()
+                # robust: wähle den letzten ts <= now
+                candidates = [p for p in prices_cache["series"] if p[0] <= now.astimezone().astimezone()]
+                if candidates:
+                    cur_price = candidates[-1][1]
 
             for cp_id, st in STATE.items():
-                target = 0.0
+                # Grundentscheidung
                 if st.mode == "off":
-                    target = 0.0
+                    target = MIN_KW  # technisch: 0 kW wäre sauber, aber Vorgabe min 3.7 -> wir setzen untere Grenze.
+                    # Hinweis: Wenn du bei "off" wirklich 0 A willst, sag Bescheid – wir senden dann 0 A Profil.
 
                 elif st.mode == "max":
-                    target = base_limit_kw
+                    target = MAX_KW
 
-                else:
+                elif st.mode == "price":
+                    # Preisgesteuert: <= Median -> MAX_KW, sonst MIN_KW
+                    if cur_price is not None and prices_cache["median"] is not None:
+                        target = MAX_KW if cur_price <= prices_cache["median"] else MIN_KW
+                    else:
+                        # Fallback: wenn keine Preise, MIN
+                        target = MIN_KW
+                    # Zusätzlich SoC-Deadline 100% bis 07:00 sicherstellen
+                    cutoff = next_dt("07:00", tzname)
+                    now_local = datetime.now(ZoneInfo(tzname))
+                    hours_left = max(0.0, (cutoff - now_local).total_seconds() / 3600.0)
+                    if hours_left > 0.0:
+                        soc_now = float(st.current_soc if st.current_soc is not None else (st.soc or 0))
+                        need_soc = max(0.0, 100 - soc_now)
+                        need_kwh = (need_soc / 100.0) * battery_kwh
+                        eff = max(0.5, min(1.0, efficiency))
+                        req_kw = (need_kwh / hours_left) / eff if need_kwh > 0 else 0.0
+                        target = max(target, req_kw)
+
+                else:  # "eco"
                     target = eco_kw
+                    # Eco-Boost aktiv?
                     if st.boost_enabled:
                         cutoff = next_dt(st.boost_cutoff_local, tzname)
                         now_local = datetime.now(ZoneInfo(tzname))
                         hours_left = max(0.0, (cutoff - now_local).total_seconds() / 3600.0)
-                        # Ziel-SoC erreicht? -> einmalige Mail, Boost bleibt an (Eco läuft weiter)
+                        # Mail bei Ziel erreicht (einmalig)
                         if st.current_soc is not None and st.current_soc >= st.boost_target_soc and not st.boost_reached_notified:
                             st.boost_reached_notified = True
-                            subj = f"[EMS] Ziel-SoC erreicht – {cp_id}"
-                            body = (
-                                f"Ladepunkt: {cp_id}\n"
-                                f"SoC: {st.current_soc}% (Ziel {st.boost_target_soc}%)\n"
-                                f"Zeit: {fmt_ts()}\n"
-                            )
-                            asyncio.create_task(send_mail(subj, body))
+                            asyncio.create_task(send_mail(
+                                f"[EMS] Ziel-SoC erreicht – {cp_id}",
+                                f"Ladepunkt: {cp_id}\nSoC: {st.current_soc}% (Ziel {st.boost_target_soc}%)\nZeit: {fmt_ts()}\n"
+                            ))
                         if hours_left > 0.0:
                             soc_now = float(st.current_soc if st.current_soc is not None else (st.soc or 0))
                             need_soc = max(0.0, st.boost_target_soc - soc_now)
@@ -85,21 +133,13 @@ async def control_loop(app, lat: float, lon: float, base_limit_kw: float):
                             req_kw = (need_kwh / hours_left) / eff if need_kwh > 0 else 0.0
                             target = max(target, req_kw)
 
-                target = clamp(target, 0.0, base_limit_kw)
+                target = clamp_kw(target)
                 st.target_kw = round(target, 2)
                 cp = app.state.cps.get(cp_id)
                 if cp:
                     await cp.push_charging_profile(st.target_kw)
 
-            await asyncio.sleep(900)
+            await asyncio.sleep(900)  # 15 Minuten
         except Exception as e:
             log.exception("control loop error: %s", e)
-            # Backend-Error-Mail throttlen
-            now = datetime.now()
-            last = getattr(app.state, "last_error_mail", None)
-            if last is None or (now - last).total_seconds() > 1800:
-                setattr(app.state, "last_error_mail", now)
-                subj = "[EMS] Backend-Fehler im Scheduler"
-                body = f"Zeit: {fmt_ts()}\nFehler: {repr(e)}\nSiehe Render-Logs für Details."
-                asyncio.create_task(send_mail(subj, body))
             await asyncio.sleep(30)
