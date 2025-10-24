@@ -31,271 +31,124 @@ function usePoll(url, intervalMs, initial = null) {
   return { data, error };
 }
 
-function StatusPill({ status, label }) {
-  const color = useMemo(() => {
-    const s = (status || "").toLowerCase();
-    if (s.includes("fault")) return "#ef4444";
-    if (s.includes("charging")) return "#10b981";
-    if (s.includes("suspend")) return "#f59e0b";
-    if (s.includes("available")) return "#3b82f6";
-    return "#6b7280";
-  }, [status]);
-  return (
-    <span style={{ padding: "2px 8px", borderRadius: 999, background: color, color: "white", fontSize: 12 }}>
-      {label || status || "Unbekannt"}
-    </span>
-  );
+function formatKw(v) {
+  if (v == null) return "-";
+  return `${Number(v).toFixed(2)} kW`;
 }
-
-function Num({ value, unit, digits = 2 }) {
-  if (value === null || value === undefined) return <span>–</span>;
-  const n = typeof value === "number" ? value : Number(value);
-  if (Number.isNaN(n)) return <span>–</span>;
-  return (
-    <span>
-      {n.toFixed(digits)} {unit || ""}
-    </span>
-  );
+function formatPct(v) {
+  if (v == null) return "-";
+  return `${v}%`;
 }
-
-function Section({ title, children, right }) {
-  return (
-    <div style={{ marginBottom: 16 }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-        <h2 style={{ margin: 0, fontSize: 18 }}>{title}</h2>
-        {right}
-      </div>
-      <div style={{ border: "1px solid #e5e7eb", borderRadius: 8, padding: 12, background: "white" }}>{children}</div>
-    </div>
-  );
-}
-
-function PriceBadge({ price }) {
-  if (!price) return null;
-  const { current_ct_per_kwh, median_ct_per_kwh, below_or_equal_median } = price;
-  const bg = below_or_equal_median === true ? "#e6fffa" : below_or_equal_median === false ? "#fff7ed" : "#f3f4f6";
-  const fg = below_or_equal_median === true ? "#0f766e" : below_or_equal_median === false ? "#9a3412" : "#374151";
-  return (
-    <div style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "6px 10px", borderRadius: 8, background: bg, color: fg }}>
-      <strong>Preis:</strong>
-      <span>
-        <Num value={current_ct_per_kwh} unit="ct/kWh" digits={2} />
-      </span>
-      <span style={{ fontSize: 12, opacity: 0.8 }}>
-        (Median <Num value={median_ct_per_kwh} unit="ct/kWh" digits={2} />)
-      </span>
-      <span style={{ fontWeight: 600 }}>
-        {below_or_equal_median === true ? "günstig" : below_or_equal_median === false ? "teuer" : "n/a"}
-      </span>
-    </div>
-  );
-}
-
-function WeatherBadge({ weather }) {
-  if (!weather) return null;
-  const { cloud_cover, shortwave_radiation, temperature_2m } = weather || {};
-  return (
-    <div style={{ display: "inline-flex", alignItems: "center", gap: 12, padding: "6px 10px", borderRadius: 8, background: "#f8fafc" }}>
-      <span>Wolkendecke: <Num value={cloud_cover} unit="%" digits={0} /></span>
-      <span>Globalstrahlung: <Num value={shortwave_radiation} unit="W/m²" digits={0} /></span>
-      <span>Temp: <Num value={temperature_2m} unit="°C" digits={1} /></span>
-    </div>
-  );
-}
-
-function ChargePointCard({ p, apiBase }) {
-  const [boost, setBoost] = useState(null);
-  const [boostErr, setBoostErr] = useState(null);
-  const [hideBoost, setHideBoost] = useState(false);
-
-  const loadBoost = async () => {
-    try {
-      const res = await fetch(`${apiBase}/api/points/${p.id}/boost`);
-      if (res.status === 404) {
-        setHideBoost(true);
-        return;
-      }
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      const json = await res.json();
-      setBoost(json);
-      setHideBoost(false);
-      setBoostErr(null);
-    } catch (e) {
-      setBoostErr(e.message || String(e));
-    }
-  };
-
-  useEffect(() => {
-    if (p?.id) loadBoost();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [p?.id]);
-
-  const updateBoost = async (next) => {
-    try {
-      const res = await fetch(`${apiBase}/api/points/${p.id}/boost`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(next),
-      });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      const json = await res.json();
-      setBoost(json);
-      setBoostErr(null);
-    } catch (e) {
-      setBoostErr(e.message || String(e));
-    }
-  };
-
-  const toggleBoost = async () => {
-    if (!boost) return;
-    await updateBoost({ ...boost, enabled: !boost.enabled });
-  };
-
-  const setBoostKw = async (kw) => {
-    if (!boost) return;
-    const clamped = Math.max(3.7, Math.min(11.0, Number(kw)));
-    await updateBoost({ ...boost, kw: clamped, enabled: boost.enabled });
-  };
-
-  const session = p.session || {};
-  const fmtTs = (ts) => (ts ? new Date(ts).toLocaleString() : "–");
-
-  return (
-    <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 14, background: "white" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-        <div>
-          <div style={{ fontWeight: 600, fontSize: 16 }}>{p.id}</div>
-          <div style={{ color: "#6b7280", fontSize: 12 }}>{p.vendor || "—"} {p.model || ""}</div>
-        </div>
-        <StatusPill status={p.status} label={p.status_label} />
-      </div>
-
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12 }}>
-        <div>
-          <div style={{ color: "#6b7280", fontSize: 12 }}>Leistung</div>
-          <div style={{ fontSize: 20, fontWeight: 600 }}>
-            <Num value={p.power_kw} unit="kW" digits={2} />
-          </div>
-        </div>
-        <div>
-          <div style={{ color: "#6b7280", fontSize: 12 }}>Ziel-Leistung</div>
-          <div style={{ fontSize: 20, fontWeight: 600 }}>
-            <Num value={p.target_kw} unit="kW" digits={2} />
-          </div>
-        </div>
-        <div>
-          <div style={{ color: "#6b7280", fontSize: 12 }}>Energie (Session)</div>
-          <div style={{ fontSize: 20, fontWeight: 600 }}>
-            <Num value={p.energy_kwh_session} unit="kWh" digits={3} />
-          </div>
-        </div>
-        <div>
-          <div style={{ color: "#6b7280", fontSize: 12 }}>SoC</div>
-          <div style={{ fontSize: 20, fontWeight: 600 }}>{p.soc ?? "–"}%</div>
-        </div>
-      </div>
-
-      <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12 }}>
-        <div style={{ color: "#374151", fontSize: 12 }}>
-          <div>Session Start: {fmtTs(session.start)}</div>
-          <div>Last seen: {fmtTs(p.last_seen)}</div>
-          <div>Tx aktiv: {p.tx_active ? "ja" : "nein"}</div>
-        </div>
-
-        {!hideBoost && (
-          <div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-              <strong>Boost</strong>
-              <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                <input
-                  type="checkbox"
-                  checked={!!(boost && boost.enabled)}
-                  onChange={toggleBoost}
-                />
-                aktiv
-              </label>
-            </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <input
-                type="range"
-                min={3.7}
-                max={11.0}
-                step={0.1}
-                value={boost?.kw ?? 11.0}
-                onChange={(e) => setBoostKw(e.target.value)}
-                style={{ width: 180 }}
-              />
-              <input
-                type="number"
-                min={3.7}
-                max={11.0}
-                step={0.1}
-                value={boost?.kw ?? 11.0}
-                onChange={(e) => setBoostKw(e.target.value)}
-                style={{ width: 90 }}
-              />
-              <span>kW</span>
-            </div>
-            {boostErr && <div style={{ color: "#b91c1c", fontSize: 12, marginTop: 6 }}>{boostErr}</div>}
-            {!boost && <div style={{ color: "#6b7280", fontSize: 12 }}>Lade Boost-Status …</div>}
-          </div>
-        )}
-      </div>
-    </div>
-  );
+function formatTime(iso) {
+  if (!iso) return "-";
+  try { return new Date(iso).toLocaleString(); } catch { return iso; }
 }
 
 export default function App() {
-  const { data: points, error: pointsErr } = usePoll(`${API_BASE}/api/points`, 2000, []);
-  const { data: price, error: priceErr } = usePoll(`${API_BASE}/api/price`, 60000, null);
-  const { data: weather, error: weatherErr } = usePoll(`${API_BASE}/api/weather`, 60000, null);
-  const { data: stats } = usePoll(`${API_BASE}/api/stats`, 5000, null);
+  const { data: points } = usePoll(`${API_BASE}/api/points`, 2000, []);
+  const { data: price } = usePoll(`${API_BASE}/api/price`, 60000, null);
+  const { data: weather } = usePoll(`${API_BASE}/api/weather`, 300000, null);
+  const [manualKw, setManualKw] = useState("11");
+
+  const currentCt = price?.current_ct_per_kwh;
+  const medianCt = price?.median_ct_per_kwh;
+  const cheaper = useMemo(() => {
+    if (currentCt == null || medianCt == null) return null;
+    return currentCt <= medianCt;
+  }, [currentCt, medianCt]);
+
+  async function sendLimit(cpId, kw) {
+    const res = await fetch(`${API_BASE}/api/points/${cpId}/limit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kw }),
+    });
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      alert(`Limit-Setzen fehlgeschlagen: ${res.status} ${t}`);
+    }
+  }
+
+  async function sendBoost(cpId, kw = 11) {
+    const res = await fetch(`${API_BASE}/api/points/${cpId}/boost`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kw }),
+    });
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      alert(`Boost fehlgeschlagen: ${res.status} ${t}`);
+    }
+  }
 
   return (
-    <div style={{ maxWidth: 1000, margin: "20px auto", padding: "0 16px", fontFamily: "-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif", color: "#111827" }}>
-      <header style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
-        <h1 style={{ margin: 0, fontSize: 22 }}>HomeCharger</h1>
-        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
-          <PriceBadge price={price} />
-          <WeatherBadge weather={weather} />
+    <div style={{ maxWidth: 1100, margin: "0 auto", padding: 16, fontFamily: "system-ui, sans-serif" }}>
+      <h1 style={{ marginBottom: 8 }}>Home Charger EMS</h1>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 12, marginBottom: 16 }}>
+        <div style={{ border: "1px solid #e5e7eb", borderRadius: 8, padding: 12 }}>
+          <h3>Strompreis</h3>
+          <div>Aktuell: {currentCt != null ? `${currentCt.toFixed(2)} ct/kWh` : "-"}</div>
+          <div>Median 24h: {medianCt != null ? `${medianCt.toFixed(2)} ct/kWh` : "-"}</div>
+          <div>Status: {cheaper == null ? "-" : cheaper ? "günstig (≤ Median)" : "teuer (> Median)"}</div>
         </div>
-      </header>
-
-      {(priceErr || weatherErr || pointsErr) && (
-        <div style={{ background: "#fef2f2", border: "1px solid #fecaca", color: "#7f1d1d", padding: 8, borderRadius: 8, marginBottom: 12, fontSize: 14 }}>
-          {priceErr && <div>Preis-API Fehler: {priceErr}</div>}
-          {weatherErr && <div>Wetter-API Fehler: {weatherErr}</div>}
-          {pointsErr && <div>Backend Fehler (/api/points): {pointsErr}</div>}
+        <div style={{ border: "1px solid #e5e7eb", borderRadius: 8, padding: 12 }}>
+          <h3>Wetter</h3>
+          <div>Bewölkung: {weather?.cloud_cover ?? "-"}%</div>
+          <div>Globalstrahlung: {weather?.shortwave_radiation ?? "-"} W/m²</div>
+          <div>Temp: {weather?.temperature_2m ?? "-"} °C</div>
         </div>
-      )}
+      </div>
 
-      <Section
-        title="Ladepunkte"
-        right={<div style={{ color: "#6b7280", fontSize: 12 }}>
-          {stats ? <>aktiv: {stats.charging} · Gesamtleistung: <Num value={stats.total_power_kw} unit="kW" digits={2} /></> : "–"}
-        </div>}
-      >
-        {Array.isArray(points) && points.length > 0 ? (
-          <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 12 }}>
-            {points.map((p) => (
-              <ChargePointCard key={p.id} p={p} apiBase={API_BASE} />
-            ))}
-          </div>
-        ) : (
-          <div style={{ color: "#6b7280" }}>
-            Noch keine Ladestation verbunden. Stelle in der Wallbox die WebSocket-URL auf
-            <div style={{ fontFamily: "monospace" }}>wss://homecharger.onrender.com/ocpp/DEINE-CP-ID</div>
-          </div>
-        )}
-      </Section>
+      <h2 style={{ marginTop: 8 }}>Ladepunkte</h2>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 12 }}>
+        {(points || []).map((p) => (
+          <div key={p.id} style={{ border: "1px solid #e5e7eb", borderRadius: 8, padding: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+              <strong>{p.id}</strong>
+              <span style={{ fontSize: 12, opacity: 0.7 }}>{formatTime(p.last_seen)}</span>
+            </div>
+            <div style={{ marginTop: 6, fontSize: 14, color: "#4b5563" }}>
+              <div>Status: <strong>{p.status ?? "-"}</strong> {p.error_code && p.error_code !== "NoError" ? `(Err: ${p.error_code})` : ""}</div>
+              <div>Leistung: <strong>{formatKw(p.power_kw)}</strong></div>
+              <div>Session kWh: <strong>{p.energy_kwh_session != null ? p.energy_kwh_session.toFixed(3) : "-"}</strong></div>
+              <div>SoC: <strong>{formatPct(p.soc)}</strong></div>
+              <div>Ziel-Leistung: <strong>{formatKw(p.target_kw)}</strong></div>
+              <div>Modell: {p.vendor ? `${p.vendor} ${p.model || ""}` : "-"}</div>
+              {p.last_profile_status && <div>Profile push: {p.last_profile_status}</div>}
+            </div>
 
-      <Section title="Live Logs">
+            <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+              <button
+                onClick={() => sendBoost(p.id, 11)}
+                style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #d1d5db", background: "#111827", color: "white" }}
+              >
+                Boost 11 kW
+              </button>
+
+              <input
+                type="number"
+                min="0"
+                step="0.1"
+                value={manualKw}
+                onChange={(e) => setManualKw(e.target.value)}
+                style={{ width: 90, padding: "6px 8px", border: "1px solid #d1d5db", borderRadius: 6 }}
+                placeholder="kW"
+              />
+              <button
+                onClick={() => sendLimit(p.id, Number(manualKw))}
+                style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #d1d5db", background: "white" }}
+              >
+                kW setzen
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ marginTop: 24 }}>
+        <h2 style={{ marginBottom: 8 }}>Live-Logs</h2>
         <LiveLogs apiBase={API_BASE} />
-      </Section>
-
-      <footer style={{ marginTop: 24, color: "#9ca3af", fontSize: 12 }}>
-        API: {API_BASE}
-      </footer>
+      </div>
     </div>
   );
 }
