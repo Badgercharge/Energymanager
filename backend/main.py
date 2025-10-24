@@ -2,13 +2,14 @@
 import os
 import json
 import logging
+from collections import deque
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketDisconnect
 
@@ -19,21 +20,49 @@ from ocpp_cs import (
     cp_registry,
 )
 
+# -----------------------------
+# Logging + Log-Puffer (Live Logs)
+# -----------------------------
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("uvicorn")
 
+LOG_BUFFER = deque(maxlen=500)
+
+
+class BufferHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            LOG_BUFFER.append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "level": record.levelname,
+                "logger": record.name,
+                "msg": record.getMessage(),
+            })
+        except Exception:
+            pass
+
+
+logging.getLogger("ocpp").addHandler(BufferHandler())
+logging.getLogger("uvicorn.error").addHandler(BufferHandler())
+logging.getLogger("uvicorn.access").addHandler(BufferHandler())
+
+# -----------------------------
+# App + CORS + Static
+# -----------------------------
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def parse_origins(val: str) -> List[str]:
     if not val:
         return ["*"]
     return [o.strip() for o in val.split(",") if o.strip()]
 
+
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "")
 ALLOWED_ORIGINS = parse_origins(FRONTEND_ORIGIN)
 
-app = FastAPI(title="HomeCharger Backend", version="2.0.0")
+app = FastAPI(title="HomeCharger Backend", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,13 +76,16 @@ app.add_middleware(
 if os.path.isdir("static"):
     app.mount("/app", StaticFiles(directory="static", html=True), name="static")
 
-# Standort / Preis / ECO
+# -----------------------------
+# Konfigurationen
+# -----------------------------
 LAT = float(os.getenv("LAT", "48.83"))
 LON = float(os.getenv("LON", "12.86"))
 PRICE_API_URL = os.getenv("PRICE_API_URL", "https://api.awattar.de/v1/marketdata")
 
 MIN_KW = float(os.getenv("MIN_KW", "3.7"))
 MAX_KW = float(os.getenv("MAX_KW", "11.0"))
+BOOST_DEFAULT_KW = float(os.getenv("BOOST_KW", "11.0"))
 
 ECO = {
     "sunny_kw": float(os.getenv("SUNNY_KW", f"{MAX_KW}")),
@@ -63,7 +95,7 @@ ECO = {
 
 BOOST: Dict[str, Dict[str, Any]] = {}
 def _boost_defaults() -> Dict[str, Any]:
-    return {"enabled": False, "target_soc": 80, "by_time": None, "mode": "eco"}
+    return {"enabled": False, "kw": BOOST_DEFAULT_KW, "target_soc": None, "by_time": None, "mode": "price"}
 
 STATUS_LABELS = {
     "unknown": "Unbekannt",
@@ -106,6 +138,7 @@ async def fetch_awattar_current_ct_per_kwh(client: httpx.AsyncClient) -> Optiona
         log.warning("price fetch error: %s", e)
         return None
 
+
 async def fetch_awattar_stats(client: httpx.AsyncClient) -> Dict[str, Any]:
     out = {"as_of": now_iso(), "current_ct_per_kwh": None, "median_ct_per_kwh": None, "below_or_equal_median": None, "source": "awattar"}
     try:
@@ -127,6 +160,7 @@ async def fetch_awattar_stats(client: httpx.AsyncClient) -> Dict[str, Any]:
     except Exception as e:
         log.warning("price stats error: %s", e)
     return out
+
 
 async def fetch_open_meteo(client: httpx.AsyncClient, lat: float, lon: float) -> Dict[str, Any]:
     out = {
@@ -159,155 +193,165 @@ async def fetch_open_meteo(client: httpx.AsyncClient, lat: float, lon: float) ->
     return out
 
 # -----------------------------
-# Health / Debug
+# API: Basics
 # -----------------------------
 @app.get("/")
-async def root():
-    return JSONResponse({"message": "HomeCharger Backend up. See /api/points and /ocpp/{cp_id}."})
+def root():
+    return {"message": "HomeCharger Backend up. See /api/points and /ocpp/{cp_id}."}
 
-@app.head("/")
-async def root_head():
-    return Response(status_code=200)
 
 @app.get("/health")
-async def health():
-    return {"status": "ok", "as_of": now_iso()}
+def health():
+    return {"ok": True, "ts": now_iso()}
 
-@app.head("/health")
-async def health_head():
-    return Response(status_code=200)
 
 @app.get("/debug/routes")
 def debug_routes():
-    routes = sorted([r.path for r in app.router.routes])
-    return routes
+    return [route.path for route in app.router.routes]
 
 # -----------------------------
-# API: Config / Price / Weather
+# API: Logs
 # -----------------------------
-@app.get("/api/config/eco")
-async def api_config_eco_get():
-    return ECO
+@app.get("/api/logs")
+async def api_logs(limit: int = 200):
+    data = list(LOG_BUFFER)[-int(limit):]
+    return {"items": data, "count": len(data)}
 
-@app.post("/api/config/eco")
-async def api_config_eco_set(payload: Dict[str, Any]):
-    if "sunny_kw" in payload:
-        ECO["sunny_kw"] = float(payload["sunny_kw"])
-    if "cloudy_kw" in payload:
-        ECO["cloudy_kw"] = float(payload["cloudy_kw"])
-    ECO["updated_at"] = now_iso()
-    return ECO
-
+# -----------------------------
+# API: Price / Weather / Stats
+# -----------------------------
 @app.get("/api/price")
 async def api_price():
     async with httpx.AsyncClient() as client:
         return await fetch_awattar_stats(client)
+
 
 @app.get("/api/weather")
 async def api_weather():
     async with httpx.AsyncClient() as client:
         return await fetch_open_meteo(client, LAT, LON)
 
-# -----------------------------
-# API: Points / Stats / Boost
-# -----------------------------
-@app.get("/api/points")
-async def api_points():
-    out = []
-    for cid, st in cp_status.items():
-        sess = st.get("session") or {}
-        status_raw = (st.get("status") or "unknown")
-        status_label = STATUS_LABELS.get(status_raw, status_raw)
-
-        item = {
-            "id": cid,
-            "status": status_raw,
-            "status_label": status_label,
-            "last_seen": st.get("last_seen"),
-            "vendor": st.get("vendor"),
-            "model": st.get("model"),
-            # Aliase + Defaultwerte
-            "power_kw": float(st.get("power_kw") or 0.0),
-            "current_kw": float(st.get("power_kw") or 0.0),
-            "target_kw": st.get("target_kw"),
-            "soc": st.get("soc"),
-            "tx_active": bool(st.get("tx_active") or False),
-            "transaction_active": bool(st.get("tx_active") or False),
-            "energy_kwh_session": float(st.get("energy_kwh_session") or 0.0),
-            "energy_kwh": float(st.get("energy_kwh_session") or 0.0),
-            "session": {
-                "start": sess.get("start"),
-                "end": sess.get("end"),
-                "est_end": sess.get("est_end"),
-            },
-            "boost": BOOST.get(cid) or _boost_defaults(),
-        }
-        out.append(item)
-    return out
 
 @app.get("/api/stats")
 async def api_stats():
-    total = len(cp_status)
-    charging = sum(1 for s in cp_status.values() if s.get("status") == "charging")
-    return {"total": total, "charging": charging, "as_of": now_iso()}
+    # Klein zusammengefasst
+    points = list(cp_status.values())
+    total_power = round(sum(p.get("power_kw") or 0.0 for p in points), 3) if points else 0.0
+    charging = sum(1 for p in points if (p.get("status") == "charging"))
+    return {"points": len(points), "charging": charging, "total_power_kw": total_power, "ts": now_iso()}
+
+# -----------------------------
+# API: ECO-Config (einfach)
+# -----------------------------
+@app.get("/api/config/eco")
+async def get_eco():
+    return ECO
+
+
+@app.post("/api/config/eco")
+async def set_eco(cfg: Dict[str, Any]):
+    if "sunny_kw" in cfg:
+        ECO["sunny_kw"] = float(cfg["sunny_kw"])
+    if "cloudy_kw" in cfg:
+        ECO["cloudy_kw"] = float(cfg["cloudy_kw"])
+    ECO["updated_at"] = now_iso()
+    return ECO
+
+# -----------------------------
+# API: Punkte / Boost
+# -----------------------------
+def map_point_view(st: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": st.get("id"),
+        "status": st.get("status"),
+        "status_label": STATUS_LABELS.get(st.get("status") or "unknown", st.get("status") or "unknown"),
+        "vendor": st.get("vendor"),
+        "model": st.get("model"),
+        "power_kw": st.get("power_kw"),
+        "target_kw": st.get("target_kw"),
+        "soc": st.get("soc"),
+        "energy_kwh_session": st.get("energy_kwh_session"),
+        "tx_active": st.get("tx_active") or False,
+        "last_seen": st.get("last_seen"),
+        "session": st.get("session"),
+    }
+
+
+@app.get("/api/points")
+async def api_points():
+    return [map_point_view(v) for v in cp_status.values()]
+
+
+@app.get("/api/points/{cp_id}")
+async def api_point(cp_id: str):
+    st = cp_status.get(cp_id)
+    if not st:
+        return JSONResponse(map_point_view({"id": cp_id, "status": "unknown"}))
+    return map_point_view(st)
+
 
 @app.get("/api/points/{cp_id}/boost")
-async def api_boost_get(cp_id: str):
-    return BOOST.get(cp_id) or _boost_defaults()
+async def get_boost(cp_id: str):
+    return BOOST.get(cp_id, _boost_defaults())
+
 
 @app.post("/api/points/{cp_id}/boost")
-async def api_boost_set(cp_id: str, payload: Dict[str, Any]):
-    conf = BOOST.get(cp_id) or _boost_defaults()
-    if "enabled" in payload:
-        conf["enabled"] = bool(payload["enabled"])
-    if "target_soc" in payload:
-        try:
-            conf["target_soc"] = max(1, min(100, int(payload["target_soc"])))
-        except Exception:
-            pass
-    if "by_time" in payload:
-        val = str(payload["by_time"]).strip() if payload["by_time"] is not None else None
-        conf["by_time"] = val
-    if "mode" in payload:
-        mode = str(payload["mode"]).lower()
-        if mode in ("eco", "price"):
-            conf["mode"] = mode
-
-    BOOST[cp_id] = conf
-    st = cp_status.get(cp_id) or {"id": cp_id}
-    st["boost"] = conf
-    cp_status[cp_id] = st
+async def set_boost(cp_id: str, body: Dict[str, Any]):
+    cfg = BOOST.get(cp_id, _boost_defaults())
+    enabled = bool(body.get("enabled", cfg["enabled"]))
+    kw = float(body.get("kw", cfg["kw"]))
+    cfg.update({"enabled": enabled, "kw": kw})
+    BOOST[cp_id] = cfg
 
     cp = cp_registry.get(cp_id)
-    if conf["enabled"]:
-        # Boost sofort auf 11 kW setzen (env override möglich)
-        target_kw = float(os.getenv("BOOST_KW", "11.0"))
-        st["target_kw"] = target_kw
-        cp_status[cp_id] = st
-        if cp is not None:
-            await cp.push_limit_kw(target_kw)
-    else:
-        if cp is not None:
+    if cp:
+        if enabled:
+            # Boost sofort mit gewünschter kW (Standard 11.0)
+            await cp.push_limit_kw(max(MIN_KW, min(kw, MAX_KW)))
+        else:
             await cp.clear_profile()
-    return conf
+    return cfg
 
 # -----------------------------
 # OCPP WebSocket Routen
 # -----------------------------
-async def _accept_ocpp(websocket: WebSocket, cp_id: str):
-    # optional Whitelist
+class FastAPIConnection:
+    """Adapter für ocpp ChargePoint, nutzt FastAPI WebSocket."""
+    def __init__(self, websocket: WebSocket):
+        self.ws = websocket
+
+    async def recv(self) -> str:
+        msg = await self.ws.receive_text()
+        return msg
+
+    async def send(self, message: str):
+        await self.ws.send_text(message)
+
+    async def close(self):
+        await self.ws.close()
+
+
+async def _ocpp_session(websocket: WebSocket, cp_id: str):
+    # Subprotocol prüfen und akzeptieren
+    subp = websocket.headers.get("sec-websocket-protocol", "")
+    if "ocpp1.6" not in subp:
+        # Viele Boxen erwarten Echo des Subprotocols
+        await websocket.accept(subprotocol="ocpp1.6")
+    else:
+        await websocket.accept(subprotocol="ocpp1.6")
+
+    # Whitelist (falls gesetzt)
     if KNOWN_CP_IDS and cp_id not in KNOWN_CP_IDS:
-        await websocket.close(code=1008)
-        log.info("connection rejected (unknown cp_id=%s)", cp_id)
+        await websocket.close(code=4403)
         return
 
-    # OCPP 1.6 Subprotocol
-    await websocket.accept(subprotocol="ocpp1.6")
-
-    cp = CentralSystem(cp_id, websocket)
+    connection = FastAPIConnection(websocket)
+    cp = CentralSystem(cp_id, connection)
     cp_registry[cp_id] = cp
+
+    # Sichtbarkeit im Status herstellen
     st = cp_status.get(cp_id) or {"id": cp_id}
-    st["status"] = st.get("status") or "unknown"
+    st["status"] = st.get("status") or "available"
     st["last_seen"] = now_iso()
     cp_status[cp_id] = st
 
@@ -317,16 +361,27 @@ async def _accept_ocpp(websocket: WebSocket, cp_id: str):
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        log.error("OCPP ASGI session error (%s): %s", cp_id, e, exc_info=True)
+        log.exception("OCPP ASGI session error (%s): %s", cp_id, e)
     finally:
         cp_registry.pop(cp_id, None)
+        st = cp_status.get(cp_id) or {"id": cp_id}
+        st["last_seen"] = now_iso()
+        cp_status[cp_id] = st
         log.info("OCPP disconnect (ASGI): %s", cp_id)
 
+
 @app.websocket("/ocpp/{cp_id}")
-async def ocpp_ws(websocket: WebSocket, cp_id: str):
-    await _accept_ocpp(websocket, cp_id)
+async def ocpp_ws_cp(websocket: WebSocket, cp_id: str):
+    await _ocpp_session(websocket, cp_id)
+
 
 @app.websocket("/ocpp/{cp_id}/{tail:path}")
-async def ocpp_ws_tail(websocket: WebSocket, cp_id: str, tail: str):
-    # Einige Boxen hängen die CP-ID doppelt an; wir ignorieren tail
-    await _accept_ocpp(websocket, cp_id)
+async def ocpp_ws_cp_tail(websocket: WebSocket, cp_id: str, tail: str):
+    # Für KEBA, die manchmal die CP-ID doppelt anhängen
+    await _ocpp_session(websocket, cp_id)
+
+
+# Optionaler Fallback ohne cp_id -> 400
+@app.websocket("/ocpp")
+async def ocpp_ws_noid(websocket: WebSocket):
+    await websocket.close(code=4400, reason="cp_id required in path /ocpp/{cp_id}")
