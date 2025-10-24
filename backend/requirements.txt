@@ -1,5 +1,10 @@
-fastapi>=0.103,<1.0
-uvicorn[standard]>=0.23
-httpx>=0.24
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
+httpx==0.27.0
+
+# OCPP-Stack (kompatibel zueinander)
 ocpp==0.17.0
+websockets==10.4
 jsonschema==3.2.0
+pyrsistent==0.19.3
+attrs==21.4.0
