@@ -11,12 +11,15 @@ from ocpp.routing import on
 
 log = logging.getLogger("ocpp")
 
+
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
 def _round01(x: float) -> float:
-    # auf 0,1 runden (viele EVSE verlangen Limit in 0,1A)
+    # auf 0,1 A runden (viele EVSE verlangen Limit in 0,1A)
     return round(x * 10.0) / 10.0
+
 
 # Live-Status aller bekannten Ladepunkte (wird von main.py importiert)
 cp_status: Dict[str, Dict[str, Any]] = {}
@@ -26,11 +29,13 @@ cp_registry: Dict[str, "CentralSystem"] = {}
 # Optionale Whitelist (leer = alle zulassen)
 KNOWN_CP_IDS = set([os.getenv("CP_ID", "504000093")]) if os.getenv("CP_ID") else set()
 
+
 def normalize_status(s: Optional[str]) -> str:
     if not s:
         return "unknown"
     s = s.strip()
     return s.replace(" ", "_").replace("-", "_").lower()
+
 
 class CentralSystem(V16ChargePoint):
     """
@@ -73,7 +78,7 @@ class CentralSystem(V16ChargePoint):
         try:
             res = await self.call(req)
             st = cp_status.get(self.id) or {"id": self.id}
-            st["target_kw"] = kw
+            st["target_kw"] = round(kw, 3)
             st["last_seen"] = _iso_now()
             cp_status[self.id] = st
             log.info("%s: SetChargingProfile sent (%.1f A ~ %.2f kW) -> %s", self.id, limit_amps, kw, getattr(res, "status", ""))
@@ -101,7 +106,7 @@ class CentralSystem(V16ChargePoint):
 
         log.info("%s: BootNotification model=%s vendor=%s", self.id, charge_point_model, charge_point_vendor)
         return call_result.BootNotification(
-            current_time=datetime.now(timezone.utc).isoformat(),
+            current_time=_iso_now(),
             interval=30,
             status=RegistrationStatus.accepted,
         )
