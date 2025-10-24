@@ -11,15 +11,12 @@ from ocpp.routing import on
 
 log = logging.getLogger("ocpp")
 
-
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 def _round01(x: float) -> float:
     # auf 0,1 A runden (viele EVSE verlangen Limit in 0,1A)
     return round(x * 10.0) / 10.0
-
 
 # Live-Status aller bekannten Ladepunkte (wird von main.py importiert)
 cp_status: Dict[str, Dict[str, Any]] = {}
@@ -29,13 +26,11 @@ cp_registry: Dict[str, "CentralSystem"] = {}
 # Optionale Whitelist (leer = alle zulassen)
 KNOWN_CP_IDS = set([os.getenv("CP_ID", "504000093")]) if os.getenv("CP_ID") else set()
 
-
 def normalize_status(s: Optional[str]) -> str:
     if not s:
         return "unknown"
     s = s.strip()
     return s.replace(" ", "_").replace("-", "_").lower()
-
 
 class CentralSystem(V16ChargePoint):
     """
@@ -105,7 +100,7 @@ class CentralSystem(V16ChargePoint):
         cp_status[self.id] = st
 
         log.info("%s: BootNotification model=%s vendor=%s", self.id, charge_point_model, charge_point_vendor)
-        return call_result.BootNotification(
+        return call_result.BootNotificationPayload(
             current_time=_iso_now(),
             interval=30,
             status=RegistrationStatus.accepted,
@@ -116,7 +111,7 @@ class CentralSystem(V16ChargePoint):
         st = cp_status.get(self.id) or {"id": self.id}
         st["last_seen"] = _iso_now()
         cp_status[self.id] = st
-        return call_result.Heartbeat(current_time=_iso_now())
+        return call_result.HeartbeatPayload(current_time=_iso_now())
 
     @on("StatusNotification")
     async def on_status(self, connector_id: int, error_code: str, status: str, **kwargs):
@@ -125,7 +120,7 @@ class CentralSystem(V16ChargePoint):
         st["error_code"] = error_code
         st["last_seen"] = _iso_now()
         cp_status[self.id] = st
-        return call_result.StatusNotification()
+        return call_result.StatusNotificationPayload()
 
     @on("StartTransaction")
     async def on_start_transaction(self, connector_id: int, id_tag: str, timestamp: str, meter_start: int, reservation_id: Optional[int] = None):
@@ -142,8 +137,7 @@ class CentralSystem(V16ChargePoint):
         st["last_seen"] = _iso_now()
         cp_status[self.id] = st
         log.info("%s: StartTransaction meter_start=%.1f Wh", self.id, float(meter_start))
-        # Einfache Zählung (oder echte ID-Strategie implementieren)
-        return call_result.StartTransaction(transaction_id=1, id_tag_info={"status": "Accepted"})
+        return call_result.StartTransactionPayload(transaction_id=1, id_tag_info={"status": "Accepted"})
 
     @on("MeterValues")
     async def on_meter_values(self, connector_id: int, meter_value: list, transaction_id: Optional[int] = None):
@@ -163,10 +157,8 @@ class CentralSystem(V16ChargePoint):
 
                 m = meas.lower()
                 if "power.active.import" in m:
-                    # Leistung in kW
                     power_kw = val if unit.lower() == "kw" else val / 1000.0
                 elif "energy.active.import.register" in m:
-                    # Zählerstand absolut
                     latest_energy_wh = val if unit.lower() == "wh" else val * 1000.0
                 elif m == "soc" or meas == "SoC":
                     try:
@@ -194,7 +186,7 @@ class CentralSystem(V16ChargePoint):
         st["last_seen"] = _iso_now()
         cp_status[self.id] = st
 
-        return call_result.MeterValues()
+        return call_result.MeterValuesPayload()
 
     @on("StopTransaction")
     async def on_stop_transaction(self, transaction_id: int, id_tag: str, timestamp: str, meter_stop: int, transaction_data: Optional[list] = None, reason: Optional[str] = None):
@@ -215,10 +207,10 @@ class CentralSystem(V16ChargePoint):
         st["last_seen"] = _iso_now()
         cp_status[self.id] = st
         log.info("%s: StopTransaction energy_kwh_session=%.3f", self.id, st.get("energy_kwh_session", 0.0))
-        return call_result.StopTransaction()
+        return call_result.StopTransactionPayload()
 
     @on("DataTransfer")
     async def on_data_transfer(self, vendor_id: str, message_id: Optional[str] = None, data: Optional[str] = None):
         # KEBA sendet gelegentlich DataTransfer; wir bestätigen neutral
         log.debug("%s: DataTransfer vendor_id=%s message_id=%s", self.id, vendor_id, message_id)
-        return call_result.DataTransfer(status="Accepted")
+        return call_result.DataTransferPayload(status="Accepted")
