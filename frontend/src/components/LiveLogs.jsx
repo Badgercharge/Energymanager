@@ -1,37 +1,54 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 
-export default function LiveLogs({ apiBase }) {
+export default function LiveLogs({ apiBase, limit = 200 }) {
   const [items, setItems] = useState([]);
-  const boxRef = useRef(null);
+  const [err, setErr] = useState(null);
 
   useEffect(() => {
+    let stop = false;
     let timer;
-    const fetchLogs = async () => {
+    const tick = async () => {
       try {
-        const res = await fetch(`${apiBase}/api/logs?limit=200`);
-        const data = await res.json();
-        setItems(data.items || []);
-        if (boxRef.current) boxRef.current.scrollTop = boxRef.current.scrollHeight;
+        const res = await fetch(`${apiBase}/api/logs?limit=${limit}`);
+        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+        const json = await res.json();
+        if (!stop) setItems(json);
+        setErr(null);
       } catch (e) {
-        // ignore transient errors
+        if (!stop) setErr(e.message || String(e));
       } finally {
-        timer = setTimeout(fetchLogs, 2000);
+        if (!stop) timer = setTimeout(tick, 2000);
       }
     };
-    fetchLogs();
-    return () => timer && clearTimeout(timer);
-  }, [apiBase]);
+    tick();
+    return () => {
+      stop = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [apiBase, limit]);
 
   return (
-    <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 8 }}>
-      <div style={{ fontWeight: 600, marginBottom: 6 }}>Live Logs</div>
-      <div ref={boxRef} style={{ height: 200, overflowY: "auto", fontFamily: "monospace", fontSize: 12, whiteSpace: "pre-wrap" }}>
-        {items.map((r, i) => (
-          <div key={i}>
-            [{r.ts}] {r.level} {r.logger}: {r.msg}
-          </div>
-        ))}
-      </div>
+    <div style={{
+      maxHeight: 260,
+      overflow: "auto",
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+      fontSize: 12,
+      background: "#0b1020",
+      color: "#e5e7eb",
+      padding: 8,
+      borderRadius: 8,
+      border: "1px solid #1f2937"
+    }}>
+      {err && <div style={{ color: "#fca5a5", marginBottom: 6 }}>Error: {err}</div>}
+      {items.length === 0 && !err && <div style={{ opacity: 0.7 }}>Keine Logs</div>}
+      {items.map((l, i) => (
+        <div key={i} style={{ whiteSpace: "pre-wrap" }}>
+          <span style={{ color: "#93c5fd" }}>{l.ts}</span>{" "}
+          <span style={{ color: "#fde68a" }}>{(l.level || "").padEnd(5)}</span>{" "}
+          <span style={{ color: "#86efac" }}>{l.logger}</span>{" "}
+          <span style={{ color: "#e5e7eb" }}>{l.msg}</span>
+        </div>
+      ))}
     </div>
   );
 }
