@@ -34,7 +34,7 @@ def parse_origins(val: str) -> List[str]:
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "")
 ALLOWED_ORIGINS = parse_origins(FRONTEND_ORIGIN)
 
-app = FastAPI(title="HomeCharger Backend", version="1.5.0")
+app = FastAPI(title="HomeCharger Backend", version="1.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,6 +65,10 @@ ECO = {
     "cloudy_kw": float(os.getenv("CLOUDY_KW", f"{MIN_KW}")),
     "updated_at": datetime.now(timezone.utc).isoformat(),
 }
+
+# Boost-Konfiguration (in-memory, pro CP)
+# Struktur: {"enabled": bool, "target_soc": int, "by_time": "HH:MM", "mode": "eco"|"price"}
+BOOST: Dict[str, Dict[str, Any]] = {}
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -244,6 +248,9 @@ async def api_points():
             "session_end": (sess.get("end") or None),
             "est_end": (sess.get("est_end") or None),
 
+            # Boost-Zustand (falls gesetzt)
+            "boost": st.get("boost"),
+
             # Sonstiges
             "soc": st.get("soc"),
             "last_seen": st.get("last_seen"),
@@ -308,6 +315,56 @@ async def api_weather():
     async with httpx.AsyncClient() as client:
         weather = await fetch_open_meteo(client, LAT, LON)
     return weather
+
+# -----------------------------------------------------------------------------
+# API: Boost (neu) – GET/POST pro Ladepunkt
+# -----------------------------------------------------------------------------
+def _boost_defaults() -> Dict[str, Any]:
+    return {"enabled": False, "target_soc": 100, "by_time": "07:00", "mode": "eco"}
+
+@app.get("/api/points/{cp_id}/boost")
+async def api_boost_get(cp_id: str):
+    conf = BOOST.get(cp_id) or _boost_defaults()
+    # Spiegel in cp_status für Frontend
+    st = cp_status.get(cp_id)
+    if st is not None:
+        st["boost"] = conf
+        cp_status[cp_id] = st
+    return conf
+
+@app.post("/api/points/{cp_id}/boost")
+async def api_boost_set(cp_id: str, payload: Dict[str, Any]):
+    conf = BOOST.get(cp_id) or _boost_defaults()
+    if "enabled" in payload:
+        conf["enabled"] = bool(payload["enabled"])
+    if "target_soc" in payload:
+        try:
+            conf["target_soc"] = max(1, min(100, int(payload["target_soc"])))
+        except Exception:
+            return JSONResponse({"error": "target_soc must be int 1..100"}, status_code=400)
+    if "by_time" in payload:
+        val = str(payload["by_time"]).strip()
+        # naive Prüfung HH:MM
+        try:
+            hh, mm = val.split(":")
+            h, m = int(hh), int(mm)
+            if not (0 <= h <= 23 and 0 <= m <= 59):
+                raise ValueError()
+            conf["by_time"] = f"{h:02d}:{m:02d}"
+        except Exception:
+            return JSONResponse({"error": "by_time must be 'HH:MM'"}, status_code=400)
+    if "mode" in payload:
+        mode = str(payload["mode"]).lower()
+        if mode not in ("eco", "price"):
+            return JSONResponse({"error": "mode must be 'eco' or 'price'"}, status_code=400)
+        conf["mode"] = mode
+
+    BOOST[cp_id] = conf
+    # Auch im Status ablegen, damit das Frontend es sofort sieht
+    st = cp_status.get(cp_id) or {"id": cp_id}
+    st["boost"] = conf
+    cp_status[cp_id] = st
+    return conf
 
 # -----------------------------------------------------------------------------
 # OCPP WebSocket Endpoints (1.6 JSON, Subprotocol: 'ocpp1.6')
