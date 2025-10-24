@@ -6,3 +6,4 @@ aiohttp==3.10.5
 apscheduler==3.10.4
 python-dotenv==1.0.1
 aiosmtplib==2.0.2
+httpx>=0.24
