@@ -18,12 +18,12 @@ def _round01(x: float) -> float:
     # auf 0,1 A runden (viele EVSE verlangen Limit in 0,1A)
     return round(x * 10.0) / 10.0
 
-# Live-Status aller bekannten Ladepunkte (wird von main.py importiert)
+# Live-Status aller bekannten Ladepunkte
 cp_status: Dict[str, Dict[str, Any]] = {}
 # Laufende ChargePoint-Instanzen (für SetChargingProfile etc.)
 cp_registry: Dict[str, "CentralSystem"] = {}
 
-# Optionale Whitelist (leer = alle zulassen)
+# Optional: Whitelist (leer = alle zulassen)
 KNOWN_CP_IDS = set([os.getenv("CP_ID", "504000093")]) if os.getenv("CP_ID") else set()
 
 def normalize_status(s: Optional[str]) -> str:
@@ -53,7 +53,7 @@ class CentralSystem(V16ChargePoint):
         except Exception:
             voltage = 230.0
 
-        # Mindeststrom ≥ 6 A (typisch)
+        # Mindeststrom ≥ 6 A (typisch), 0,1 A Schrittweite
         limit_amps = max(6.0, _round01((kw * 1000.0) / (voltage * phases)))
 
         profile = {
@@ -75,6 +75,7 @@ class CentralSystem(V16ChargePoint):
             st = cp_status.get(self.id) or {"id": self.id}
             st["target_kw"] = round(kw, 3)
             st["last_seen"] = _iso_now()
+            st["last_profile_status"] = getattr(res, "status", "")
             cp_status[self.id] = st
             log.info("%s: SetChargingProfile sent (%.1f A ~ %.2f kW) -> %s", self.id, limit_amps, kw, getattr(res, "status", ""))
         except Exception as e:
