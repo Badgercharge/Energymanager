@@ -6,25 +6,24 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.websockets import WebSocketDisconnect
 
-# OCPP-Server-Klasse und Status-Registry (aus deiner ocpp_cs.py)
 from ocpp_cs import (
     CentralSystem,
-    extract_cp_id_from_path,
     KNOWN_CP_IDS,
     cp_status,
     cp_registry,
 )
 
-# -----------------------------------------------------------------------------
-# Logging / App
-# -----------------------------------------------------------------------------
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("uvicorn")
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 def parse_origins(val: str) -> List[str]:
     if not val:
@@ -34,7 +33,7 @@ def parse_origins(val: str) -> List[str]:
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "")
 ALLOWED_ORIGINS = parse_origins(FRONTEND_ORIGIN)
 
-app = FastAPI(title="HomeCharger Backend", version="1.6.0")
+app = FastAPI(title="HomeCharger Backend", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,40 +43,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Wichtig: Static NICHT auf "/" mounten, damit /api/* und /ocpp nicht überschrieben werden
+# Static NICHT auf "/" mounten, um /api und /ocpp nicht zu überschreiben
 if os.path.isdir("static"):
     app.mount("/app", StaticFiles(directory="static", html=True), name="static")
 
-# -----------------------------------------------------------------------------
-# Standort / Konfiguration
-# -----------------------------------------------------------------------------
-LAT = float(os.getenv("LAT", "48.83"))   # Radldorf
+# Standort / Preis / ECO
+LAT = float(os.getenv("LAT", "48.83"))
 LON = float(os.getenv("LON", "12.86"))
-
-# Preis: A-WATTAR Deutschland (ohne API-Key)
 PRICE_API_URL = os.getenv("PRICE_API_URL", "https://api.awattar.de/v1/marketdata")
 
-# Eco-Settings (vereinfacht: sunny_kw, cloudy_kw)
-MIN_KW = 3.7
-MAX_KW = 11.0
+MIN_KW = float(os.getenv("MIN_KW", "3.7"))
+MAX_KW = float(os.getenv("MAX_KW", "11.0"))
+
 ECO = {
     "sunny_kw": float(os.getenv("SUNNY_KW", f"{MAX_KW}")),
     "cloudy_kw": float(os.getenv("CLOUDY_KW", f"{MIN_KW}")),
-    "updated_at": datetime.now(timezone.utc).isoformat(),
+    "updated_at": now_iso(),
 }
 
-# Boost-Konfiguration (in-memory, pro CP)
-# Struktur: {"enabled": bool, "target_soc": int, "by_time": "HH:MM", "mode": "eco"|"price"}
 BOOST: Dict[str, Dict[str, Any]] = {}
-
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
+def _boost_defaults() -> Dict[str, Any]:
+    return {"enabled": False, "target_soc": 80, "by_time": None, "mode": "eco"}
 
 STATUS_LABELS = {
     "unknown": "Unbekannt",
@@ -92,10 +78,12 @@ STATUS_LABELS = {
     "faulted": "Fehler",
 }
 
+# -----------------------------
+# Helpers: Price / Weather
+# -----------------------------
 async def fetch_awattar_current_ct_per_kwh(client: httpx.AsyncClient) -> Optional[float]:
     """
-    A-WATTAR liefert marketprice in EUR/MWh.
-    Umrechnung: ct/kWh = (EUR/MWh) / 10.
+    A-WATTAR: marketprice in EUR/MWh -> ct/kWh = (EUR/MWh) / 10
     """
     try:
         r = await client.get(PRICE_API_URL, timeout=15)
@@ -119,13 +107,7 @@ async def fetch_awattar_current_ct_per_kwh(client: httpx.AsyncClient) -> Optiona
         return None
 
 async def fetch_awattar_stats(client: httpx.AsyncClient) -> Dict[str, Any]:
-    out = {
-        "as_of": now_iso(),
-        "current_ct_per_kwh": None,
-        "median_ct_per_kwh": None,
-        "below_or_equal_median": None,
-        "source": "awattar",
-    }
+    out = {"as_of": now_iso(), "current_ct_per_kwh": None, "median_ct_per_kwh": None, "below_or_equal_median": None, "source": "awattar"}
     try:
         r = await client.get(PRICE_API_URL, timeout=15)
         r.raise_for_status()
@@ -135,12 +117,9 @@ async def fetch_awattar_stats(client: httpx.AsyncClient) -> Dict[str, Any]:
             return out
         prices_ct = [float(it["marketprice"]) / 10.0 for it in items if "marketprice" in it]
         if prices_ct:
-            prices_ct_sorted = sorted(prices_ct)
-            n = len(prices_ct_sorted)
-            if n % 2 == 1:
-                median = prices_ct_sorted[n // 2]
-            else:
-                median = (prices_ct_sorted[n // 2 - 1] + prices_ct_sorted[n // 2]) / 2.0
+            s = sorted(prices_ct)
+            n = len(s)
+            median = s[n // 2] if n % 2 == 1 else (s[n // 2 - 1] + s[n // 2]) / 2.0
             out["median_ct_per_kwh"] = round(median, 3)
         out["current_ct_per_kwh"] = await fetch_awattar_current_ct_per_kwh(client)
         if out["current_ct_per_kwh"] is not None and out["median_ct_per_kwh"] is not None:
@@ -179,9 +158,9 @@ async def fetch_open_meteo(client: httpx.AsyncClient, lat: float, lon: float) ->
         log.warning("weather fetch error: %s", e)
     return out
 
-# -----------------------------------------------------------------------------
-# Health / Debug / Root
-# -----------------------------------------------------------------------------
+# -----------------------------
+# Health / Debug
+# -----------------------------
 @app.get("/")
 async def root():
     return JSONResponse({"message": "HomeCharger Backend up. See /api/points and /ocpp/{cp_id}."})
@@ -203,134 +182,78 @@ def debug_routes():
     routes = sorted([r.path for r in app.router.routes])
     return routes
 
-# -----------------------------------------------------------------------------
-# API: Points / Stats / Eco / Price / Weather
-# -----------------------------------------------------------------------------
-@app.get("/api/points")
-async def api_points():
-    """
-    Liefert Status der Ladepunkte inkl. UI‑Aliase und stabilen Default‑Werten,
-    damit das Frontend nie null/undefined anzeigen muss.
-    """
-    out = []
-    for cid, st in cp_status.items():
-        sess = st.get("session") or {}
-        status_raw = (st.get("status") or "Unknown")
-        status_key = str(status_raw).replace(" ", "_").lower()
-        status_label = STATUS_LABELS.get(status_key, "Unbekannt")
-
-        power_kw = st.get("power_kw")
-        if power_kw is None:
-            power_kw = 0.0
-        energy_kwh_session = st.get("energy_kwh_session")
-        if energy_kwh_session is None:
-            energy_kwh_session = 0.0
-
-        out.append({
-            "id": cid,
-            "status": status_raw,
-            "status_label": status_label,
-
-            # Leistung
-            "power_kw": round(float(power_kw), 3),
-            "current_kw": round(float(power_kw), 3),  # UI-Alias
-            "target_kw": (st.get("target_kw") if st.get("target_kw") is not None else 0.0),
-            "mode": st.get("mode"),
-
-            # Transaktion
-            "tx_active": bool(st.get("tx_active")),
-            "transaction_active": bool(st.get("tx_active")),  # UI-Alias
-
-            # Session
-            "energy_kwh_session": round(float(energy_kwh_session), 3),
-            "energy_kwh": round(float(energy_kwh_session), 3),  # UI-Alias
-            "session_start": (sess.get("start") or None),
-            "session_end": (sess.get("end") or None),
-            "est_end": (sess.get("est_end") or None),
-
-            # Boost-Zustand (falls gesetzt)
-            "boost": st.get("boost"),
-
-            # Sonstiges
-            "soc": st.get("soc"),
-            "last_seen": st.get("last_seen"),
-            "model": st.get("model"),
-            "vendor": st.get("vendor"),
-        })
-    return out
-
-@app.get("/api/stats")
-async def api_stats():
-    """
-    Kleiner Überblick über Sessions/Leistung (aggregiert aus cp_status).
-    """
-    sessions = []
-    for st in cp_status.values():
-        sess = st.get("session") or {}
-        sessions.append({
-            "id": st.get("id"),
-            "status": st.get("status"),
-            "start": sess.get("start"),
-            "end": sess.get("end"),
-            "energy_kwh": st.get("energy_kwh_session", 0.0),
-            "power_kw": st.get("power_kw", 0.0),
-            "soc": st.get("soc"),
-        })
-    return {"as_of": now_iso(), "sessions": sessions}
-
-@app.get("/api/eco")
-async def api_eco_get():
-    return ECO
-
-@app.post("/api/eco")
-async def api_eco_set(payload: Dict[str, Any]):
-    """
-    Erwartet z. B. {"sunny_kw": 11.0, "cloudy_kw": 3.7}
-    """
-    sunny = payload.get("sunny_kw", ECO["sunny_kw"])
-    cloudy = payload.get("cloudy_kw", ECO["cloudy_kw"])
-    try:
-        sunny = float(sunny)
-        cloudy = float(cloudy)
-    except Exception:
-        return JSONResponse({"error": "invalid payload"}, status_code=400)
-    ECO["sunny_kw"] = clamp(sunny, MIN_KW, MAX_KW)
-    ECO["cloudy_kw"] = clamp(cloudy, MIN_KW, MAX_KW)
-    ECO["updated_at"] = now_iso()
-    return ECO
-
-# Legacy-Alias, um 404 im Frontend zu vermeiden
+# -----------------------------
+# API: Config / Price / Weather
+# -----------------------------
 @app.get("/api/config/eco")
-async def api_config_eco_alias():
+async def api_config_eco_get():
+    return ECO
+
+@app.post("/api/config/eco")
+async def api_config_eco_set(payload: Dict[str, Any]):
+    if "sunny_kw" in payload:
+        ECO["sunny_kw"] = float(payload["sunny_kw"])
+    if "cloudy_kw" in payload:
+        ECO["cloudy_kw"] = float(payload["cloudy_kw"])
+    ECO["updated_at"] = now_iso()
     return ECO
 
 @app.get("/api/price")
 async def api_price():
     async with httpx.AsyncClient() as client:
-        stats = await fetch_awattar_stats(client)
-    return stats
+        return await fetch_awattar_stats(client)
 
 @app.get("/api/weather")
 async def api_weather():
     async with httpx.AsyncClient() as client:
-        weather = await fetch_open_meteo(client, LAT, LON)
-    return weather
+        return await fetch_open_meteo(client, LAT, LON)
 
-# -----------------------------------------------------------------------------
-# API: Boost (neu) – GET/POST pro Ladepunkt
-# -----------------------------------------------------------------------------
-def _boost_defaults() -> Dict[str, Any]:
-    return {"enabled": False, "target_soc": 100, "by_time": "07:00", "mode": "eco"}
+# -----------------------------
+# API: Points / Stats / Boost
+# -----------------------------
+@app.get("/api/points")
+async def api_points():
+    out = []
+    for cid, st in cp_status.items():
+        sess = st.get("session") or {}
+        status_raw = (st.get("status") or "unknown")
+        status_label = STATUS_LABELS.get(status_raw, status_raw)
+
+        item = {
+            "id": cid,
+            "status": status_raw,
+            "status_label": status_label,
+            "last_seen": st.get("last_seen"),
+            "vendor": st.get("vendor"),
+            "model": st.get("model"),
+            # Aliase + Defaultwerte
+            "power_kw": float(st.get("power_kw") or 0.0),
+            "current_kw": float(st.get("power_kw") or 0.0),
+            "target_kw": st.get("target_kw"),
+            "soc": st.get("soc"),
+            "tx_active": bool(st.get("tx_active") or False),
+            "transaction_active": bool(st.get("tx_active") or False),
+            "energy_kwh_session": float(st.get("energy_kwh_session") or 0.0),
+            "energy_kwh": float(st.get("energy_kwh_session") or 0.0),
+            "session": {
+                "start": sess.get("start"),
+                "end": sess.get("end"),
+                "est_end": sess.get("est_end"),
+            },
+            "boost": BOOST.get(cid) or _boost_defaults(),
+        }
+        out.append(item)
+    return out
+
+@app.get("/api/stats")
+async def api_stats():
+    total = len(cp_status)
+    charging = sum(1 for s in cp_status.values() if s.get("status") == "charging")
+    return {"total": total, "charging": charging, "as_of": now_iso()}
 
 @app.get("/api/points/{cp_id}/boost")
 async def api_boost_get(cp_id: str):
-    conf = BOOST.get(cp_id) or _boost_defaults()
-    # Spiegel in cp_status für Frontend
-    st = cp_status.get(cp_id)
-    if st is not None:
-        st["boost"] = conf
-        cp_status[cp_id] = st
-    return conf
+    return BOOST.get(cp_id) or _boost_defaults()
 
 @app.post("/api/points/{cp_id}/boost")
 async def api_boost_set(cp_id: str, payload: Dict[str, Any]):
@@ -341,102 +264,69 @@ async def api_boost_set(cp_id: str, payload: Dict[str, Any]):
         try:
             conf["target_soc"] = max(1, min(100, int(payload["target_soc"])))
         except Exception:
-            return JSONResponse({"error": "target_soc must be int 1..100"}, status_code=400)
+            pass
     if "by_time" in payload:
-        val = str(payload["by_time"]).strip()
-        # naive Prüfung HH:MM
-        try:
-            hh, mm = val.split(":")
-            h, m = int(hh), int(mm)
-            if not (0 <= h <= 23 and 0 <= m <= 59):
-                raise ValueError()
-            conf["by_time"] = f"{h:02d}:{m:02d}"
-        except Exception:
-            return JSONResponse({"error": "by_time must be 'HH:MM'"}, status_code=400)
+        val = str(payload["by_time"]).strip() if payload["by_time"] is not None else None
+        conf["by_time"] = val
     if "mode" in payload:
         mode = str(payload["mode"]).lower()
-        if mode not in ("eco", "price"):
-            return JSONResponse({"error": "mode must be 'eco' or 'price'"}, status_code=400)
-        conf["mode"] = mode
+        if mode in ("eco", "price"):
+            conf["mode"] = mode
 
     BOOST[cp_id] = conf
-    # Auch im Status ablegen, damit das Frontend es sofort sieht
     st = cp_status.get(cp_id) or {"id": cp_id}
     st["boost"] = conf
     cp_status[cp_id] = st
+
+    cp = cp_registry.get(cp_id)
+    if conf["enabled"]:
+        # Boost sofort auf 11 kW setzen (env override möglich)
+        target_kw = float(os.getenv("BOOST_KW", "11.0"))
+        st["target_kw"] = target_kw
+        cp_status[cp_id] = st
+        if cp is not None:
+            await cp.push_limit_kw(target_kw)
+    else:
+        if cp is not None:
+            await cp.clear_profile()
     return conf
 
-# -----------------------------------------------------------------------------
-# OCPP WebSocket Endpoints (1.6 JSON, Subprotocol: 'ocpp1.6')
-# -----------------------------------------------------------------------------
-class FastAPIWebSocketWrapper:
-    """
-    Adaptiert fastapi.WebSocket auf das Interface, das die ocpp-Bibliothek erwartet:
-    - send(str)
-    - recv() -> str
-    und stellt subprotocol bereit.
-    """
-    def __init__(self, ws: WebSocket, subprotocol: str = "ocpp1.6"):
-        self._ws = ws
-        self.subprotocol = subprotocol
-
-    async def send(self, message: str):
-        await self._ws.send_text(message)
-
-    async def recv(self) -> str:
-        return await self._ws.receive_text()
-
-async def _serve_ocpp(websocket: WebSocket, path_override: Optional[str] = None):
-    """
-    Gemeinsame Handler-Logik für alle /ocpp*-Routen.
-    """
-    # Subprotocol aushandeln (zwingend für viele Boxen)
-    await websocket.accept(subprotocol="ocpp1.6")
-
-    # CP-ID aus dem URL-Pfad extrahieren (robust gegen doppelte IDs)
-    path = path_override or websocket.url.path
-    cp_id = extract_cp_id_from_path(path)
-    if not cp_id or cp_id.lower() == "unknown":
-        # als Fallback (manche Boxen übergeben sie im Subprotocol-Header)
-        proto_hdr = websocket.headers.get("Sec-WebSocket-Protocol") or ""
-        cp_id = proto_hdr.replace("ocpp1.6", "").strip() or "unknown"
-
-    # Whitelist prüfen (falls gesetzt)
+# -----------------------------
+# OCPP WebSocket Routen
+# -----------------------------
+async def _accept_ocpp(websocket: WebSocket, cp_id: str):
+    # optional Whitelist
     if KNOWN_CP_IDS and cp_id not in KNOWN_CP_IDS:
-        log.info("connection rejected (403 Forbidden) for cp_id=%s", cp_id)
-        # WS-Close 1008 (Policy Violation)
         await websocket.close(code=1008)
+        log.info("connection rejected (unknown cp_id=%s)", cp_id)
         return
 
-    log.info("OCPP connect (ASGI): %s", cp_id)
-    connection = FastAPIWebSocketWrapper(websocket, subprotocol="ocpp1.6")
-    cp = CentralSystem(cp_id, connection)
-    cp_registry[cp_id] = cp  # registrieren
+    # OCPP 1.6 Subprotocol
+    await websocket.accept(subprotocol="ocpp1.6")
 
+    cp = CentralSystem(cp_id, websocket)
+    cp_registry[cp_id] = cp
+    st = cp_status.get(cp_id) or {"id": cp_id}
+    st["status"] = st.get("status") or "unknown"
+    st["last_seen"] = now_iso()
+    cp_status[cp_id] = st
+
+    log.info("OCPP connect (ASGI): %s", cp_id)
     try:
-        await cp.start()  # blockiert, bis die Verbindung beendet wird
+        await cp.start()  # blockiert bis Disconnect
     except WebSocketDisconnect:
         pass
     except Exception as e:
         log.error("OCPP ASGI session error (%s): %s", cp_id, e, exc_info=True)
-        try:
-            await websocket.close()
-        except Exception:
-            pass
     finally:
+        cp_registry.pop(cp_id, None)
         log.info("OCPP disconnect (ASGI): %s", cp_id)
-        # cp_registry.pop(cp_id, None)  # optional aufräumen
-
-@app.websocket("/ocpp")
-async def ocpp_ws_root(websocket: WebSocket):
-    await _serve_ocpp(websocket)
 
 @app.websocket("/ocpp/{cp_id}")
-async def ocpp_ws_with_id(websocket: WebSocket, cp_id: str):
-    # Die CP-ID steckt in der URL – dennoch verwendet extract_cp_id_from_path
-    await _serve_ocpp(websocket)
+async def ocpp_ws(websocket: WebSocket, cp_id: str):
+    await _accept_ocpp(websocket, cp_id)
 
 @app.websocket("/ocpp/{cp_id}/{tail:path}")
-async def ocpp_ws_with_tail(websocket: WebSocket, cp_id: str, tail: str):
-    # Fängt Sonderfälle wie /ocpp/<id>/<id> ab (manche Boxen hängen sie doppelt an)
-    await _serve_ocpp(websocket)
+async def ocpp_ws_tail(websocket: WebSocket, cp_id: str, tail: str):
+    # Einige Boxen hängen die CP-ID doppelt an; wir ignorieren tail
+    await _accept_ocpp(websocket, cp_id)
