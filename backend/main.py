@@ -1,172 +1,115 @@
-import asyncio
-import logging
+# backend/main.py
 import os
-from datetime import datetime, timedelta, timezone
+import logging
+from typing import List
 
-from fastapi import FastAPI, WebSocket, Body
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from dotenv import load_dotenv
 
-from ocpp_cs import CentralSystem
-from models import STATE, ENERGY_LOGS, ChargePointState
-from scheduler import control_loop, weather_loop
-from mailer import send_mail, fmt_ts
+# OCPP-Server-Seite (deine ocpp_cs.py)
+from ocpp_cs import CentralSystem, extract_cp_id_from_path, KNOWN_CP_IDS, cp_status
 
-load_dotenv()
+log = logging.getLogger("uvicorn")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-app = FastAPI()
 
-ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").split(",")
+def parse_origins(val: str) -> List[str]:
+    if not val:
+        return ["*"]
+    return [o.strip() for o in val.split(",") if o.strip()]
+
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "")
+ALLOWED_ORIGINS = parse_origins(FRONTEND_ORIGIN)
+
+app = FastAPI(title="HomeCharger Backend", version="1.0.0")
+
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.state.cps = {}
-app.state.eco = {
-    "sunny_kw": max(3.7, min(11.0, float(os.getenv("SUNNY_KW", "11.0")))),
-    "cloudy_kw": max(3.7, min(11.0, float(os.getenv("CLOUDY_KW", "3.7")))),
-}
-app.state.pricing = {"as_of": None, "current_ct_per_kwh": None, "median_ct_per_kwh": None, "below_or_equal_median": None}
-app.state.weather = {"as_of": None}
+# Static Files NICHT auf "/" mounten, um /api und /ocpp nicht zu überschreiben
+if os.path.isdir("static"):
+    app.mount("/app", StaticFiles(directory="static", html=True), name="static")
 
-class FastAPIWebSocketAdapter:
-    def __init__(self, ws: WebSocket): self.ws = ws
-    async def recv(self) -> str: return await self.ws.receive_text()
-    async def send(self, message: str): await self.ws.send_text(message)
+# Adapter: macht Starlette WebSocket kompatibel zu ocpp.ChargePoint (send/recv)
+class StarletteWSAdapter:
+    def __init__(self, ws: WebSocket):
+        self.ws = ws
 
-@app.websocket("/ocpp/{cp_id}")
-async def ocpp(ws: WebSocket, cp_id: str):
-    await ws.accept(subprotocol="ocpp1.6")
-    logging.info("WS connected: %s", cp_id)
-    ocpp_ws = FastAPIWebSocketAdapter(ws)
-    cp = CentralSystem(cp_id, ocpp_ws)
-    app.state.cps[cp_id] = cp
-    try:
-        await cp.start()
-    except Exception as e:
-        logging.exception("WS error %s: %s", cp_id, e)
-        asyncio.create_task(send_mail(f"[EMS] Backend-Fehler OCPP WS – {cp_id}", f"Ladepunkt: {cp_id}\nZeit: {fmt_ts()}\nFehler: {repr(e)}"))
-        raise
-    finally:
-        logging.info("WS disconnected: %s", cp_id)
-        if cp_id in STATE:
-            STATE[cp_id].connected = False
-        app.state.cps.pop(cp_id, None)
+    async def recv(self) -> str:
+        return await self.ws.receive_text()
 
-@app.get("/api/points")
-def list_points():
-    return [vars(s) for s in STATE.values()]
+    async def send(self, data: str):
+        await self.ws.send_text(data)
 
-@app.post("/api/points/{cp_id}/mode/{mode}")
-def set_mode(cp_id: str, mode: str):
-    assert mode in ["eco", "max", "off", "price", "manual"]
-    s = STATE.get(cp_id) or ChargePointState(id=cp_id)
-    s.mode = mode
-    STATE[cp_id] = s
-    return {"ok": True, "mode": mode}
-
-@app.post("/api/points/{cp_id}/limit")
-def set_limit(cp_id: str, kw: float):
-    s = STATE.get(cp_id) or ChargePointState(id=cp_id)
-    kw = max(3.7, min(11.0, float(kw)))
-    s.target_kw = kw
-    s.mode = "manual"
-    STATE[cp_id] = s
-    cp = app.state.cps.get(cp_id)
-    if cp:
-        asyncio.create_task(cp.push_charging_profile(kw))
-    return {"ok": True, "kw": kw, "mode": s.mode}
-
-@app.get("/api/points/{cp_id}/boost")
-def get_boost(cp_id: str):
-    s = STATE.get(cp_id)
-    if not s:
-        return {"enabled": False}
-    return {"enabled": s.boost_enabled, "cutoff_local": s.boost_cutoff_local, "target_soc": s.boost_target_soc}
-
-@app.post("/api/points/{cp_id}/boost")
-def set_boost(cp_id: str, enabled: bool = Body(...), cutoff_local: str = Body(..., embed=True), target_soc: int = Body(...)):
-    s = STATE.get(cp_id) or ChargePointState(id=cp_id)
-    s.boost_enabled = bool(enabled)
-    s.boost_cutoff_local = cutoff_local
-    s.boost_target_soc = int(target_soc)
-    s.boost_reached_notified = False
-    STATE[cp_id] = s
-    if s.mode in ["off", "max"]:
-        # Boost greift in Eco/Price. Wir lassen den Modus unverändert, Anzeige erfolgt im Frontend kontextbezogen.
-        pass
-    return {"ok": True}
-
-@app.get("/api/config/eco")
-def get_eco():
-    return app.state.eco
-
-@app.post("/api/config/eco")
-def post_eco(sunny_kw: float = Body(...), cloudy_kw: float = Body(...)):
-    app.state.eco["sunny_kw"] = max(3.7, min(11.0, float(sunny_kw)))
-    app.state.eco["cloudy_kw"] = max(3.7, min(11.0, float(cloudy_kw)))
-    return {"ok": True, **app.state.eco}
-
-@app.get("/api/price")
-def get_price():
-    return app.state.pricing
-
-@app.get("/api/weather")
-def get_weather():
-    return app.state.weather
-
-def _sum_range(points, days):
-    now = datetime.now(timezone.utc)
-    since = now - timedelta(days=days)
-    total = 0.0
-    for _, rows in points.items():
-        if not rows:
-            continue
-        first = None; last = None
-        for ts, kwh in rows:
-            if ts >= since:
-                if first is None:
-                    first = kwh
-                last = kwh
-        if first is not None and last is not None:
-            total += max(0.0, last - first)
-    return round(total, 2)
-
-def _per_cp(points, days):
-    now = datetime.now(timezone.utc)
-    since = now - timedelta(days=days)
-    out = {}
-    for cp_id, rows in points.items():
-        first = None; last = None
-        for ts, kwh in rows:
-            if ts >= since:
-                if first is None:
-                    first = kwh
-                last = kwh
-        out[cp_id] = round(max(0.0, (last - first) if (first is not None and last is not None) else 0.0), 2)
-    return out
-
-@app.get("/api/stats")
-def stats():
-    return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "total": {"7d": _sum_range(ENERGY_LOGS,7), "30d": _sum_range(ENERGY_LOGS,30)},
-        "by_point": {"7d": _per_cp(ENERGY_LOGS,7), "30d": _per_cp(ENERGY_LOGS,30)},
-    }
-
-@app.get("/")
-def root():
-    return {"ok": True, "msg": "EMS backend running"}
+    async def close(self, code: int = 1000, reason: str = ""):
+        try:
+            await self.ws.close(code=code)
+        except Exception:
+            pass
 
 @app.on_event("startup")
-async def on_start():
-    lat = float(os.getenv("LAT", "48.87"))
-    lon = float(os.getenv("LON", "12.65"))
-    base_limit_kw = float(os.getenv("BASE_LIMIT_KW", "11"))
-    tz = os.getenv("LOCAL_TZ", "Europe/Berlin")
-    asyncio.create_task(control_loop(app, lat, lon, base_limit_kw))
-    asyncio.create_task(weather_loop(app, lat, lon, tz))
+async def on_startup():
+    log.info("Startup: FRONTEND_ORIGIN=%s", ALLOWED_ORIGINS)
+    log.info("Startup: KNOWN_CP_IDS=%s", ",".join(sorted(KNOWN_CP_IDS)) if KNOWN_CP_IDS else "(none)")
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@app.get("/api/version")
+async def version():
+    return {"name": "homecharger-backend", "version": "1.0.0"}
+
+@app.get("/api/points")
+async def api_points():
+    # Gibt alle bekannten CP-Status als Liste zurück
+    # Beispiel-Felder: id, status, power_w, last_seen, session{start_time, kwh, ...}
+    return list(cp_status.values())
+
+# OCPP 1.6 WebSocket-Routen
+@app.websocket("/ocpp")
+@app.websocket("/ocpp/{cp_id}")
+async def ocpp_ws(ws: WebSocket, cp_id: str | None = None):
+    # OCPP Subprotocol aushandeln
+    # Viele Boxen erwarten "ocpp1.6"
+    try:
+        await ws.accept(subprotocol="ocpp1.6")
+    except Exception:
+        # Fallback (akzeptieren ohne Subprotocol, falls Gerät keines sendet)
+        await ws.accept()
+
+    # CP-ID aus Pfad oder Default ableiten
+    if not cp_id:
+        cp_id = extract_cp_id_from_path("/ocpp")
+
+    # Whitelist prüfen
+    if KNOWN_CP_IDS and cp_id not in KNOWN_CP_IDS:
+        log.warning("Reject OCPP for unknown CP-ID: %s", cp_id)
+        await ws.close(code=4000)
+        return
+
+    log.info("OCPP connect (ASGI): %s", cp_id)
+    adapter = StarletteWSAdapter(ws)
+    cp = CentralSystem(cp_id, adapter)
+
+    try:
+        # Start blockiert bis der Client die Verbindung schließt
+        await cp.start()
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        log.exception("OCPP ASGI session error (%s): %s", cp_id, e)
+    finally:
+        log.info("OCPP disconnect (ASGI): %s", cp_id)
+
+# Optional: Root zeigt minimalen Hinweis (damit "/" nicht 404 ist)
+@app.get("/")
+async def root():
+    return JSONResponse({"message": "HomeCharger Backend up. See /api/points and /ocpp/{cp_id}."})
