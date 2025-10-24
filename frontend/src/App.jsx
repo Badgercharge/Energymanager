@@ -1,296 +1,301 @@
-import React, { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from "react";
+import LiveLogs from "./components/LiveLogs";
 
-const API = import.meta.env.VITE_API || window.location.origin
-const MIN_KW = 3.7
-const MAX_KW = 11.0
+const API_BASE = import.meta.env.VITE_API_BASE || "https://homecharger.onrender.com";
 
-// ---- API helpers ----
-async function fetchPoints(){ const r=await fetch(`${API}/api/points`); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
-async function fetchEco(){ const r=await fetch(`${API}/api/config/eco`); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
-async function saveEco(data){ const r=await fetch(`${API}/api/config/eco`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
-async function setMode(id,mode){ await fetch(`${API}/api/points/${id}/mode/${mode}`,{method:'POST'}) }
-async function setLimit(id,kw){ await fetch(`${API}/api/points/${id}/limit?kw=${kw}`,{method:'POST'}) }
-async function fetchStats(){ const r=await fetch(`${API}/api/stats`); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
-async function fetchBoost(id){ const r=await fetch(`${API}/api/points/${id}/boost`); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
-async function saveBoost(id,data){ await fetch(`${API}/api/points/${id}/boost`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}) }
-async function fetchPrice(){ const r=await fetch(`${API}/api/price`); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
-async function fetchWeather(){ const r=await fetch(`${API}/api/weather`); if(!r.ok) throw new Error(`API ${r.status}`); return r.json() }
-
-// ---- formatting helpers ----
-function fmtDT(s){
-  if(!s) return "—"
-  const d=new Date(s)
-  return d.toLocaleString()
+function usePoll(url, intervalMs, initial = null) {
+  const [data, setData] = useState(initial);
+  const [error, setError] = useState(null);
+  useEffect(() => {
+    let stop = false;
+    let timer;
+    const tick = async () => {
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+        const json = await res.json();
+        if (!stop) setData(json);
+        setError(null);
+      } catch (e) {
+        if (!stop) setError(e.message || String(e));
+      } finally {
+        if (!stop) timer = setTimeout(tick, intervalMs);
+      }
+    };
+    tick();
+    return () => {
+      stop = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [url, intervalMs]);
+  return { data, error };
 }
-function fmtTime(s){
-  if(!s) return "—"
-  const d=new Date(s)
-  return d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"})
-}
 
-// ---- UI components ----
-function ModeInfo(){
+function StatusPill({ status, label }) {
+  const color = useMemo(() => {
+    const s = (status || "").toLowerCase();
+    if (s.includes("fault")) return "#ef4444";
+    if (s.includes("charging")) return "#10b981";
+    if (s.includes("suspend")) return "#f59e0b";
+    if (s.includes("available")) return "#3b82f6";
+    return "#6b7280";
+  }, [status]);
   return (
-    <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm">
-      <div className="px-4 py-3 border-b border-slate-100">
-        <h3 className="text-sm font-semibold text-slate-800">Modi</h3>
-      </div>
-      <div className="p-4 text-sm text-slate-600 space-y-2">
-        <p><strong>Eco</strong>: PV‑geführt (zwischen CLOUDY_KW und SUNNY_KW) mit optionalem Boost bis Uhrzeit.</p>
-        <p><strong>Price</strong>: Preisgeführt im 15‑Min‑Raster. ≤ Median: {MAX_KW} kW, sonst {MIN_KW} kW. 100% bis 07:00 abgesichert.</p>
-        <p><strong>Max</strong>: Konstant {MAX_KW} kW. · <strong>Aus</strong>: {MIN_KW} kW Untergrenze.</p>
-        <p><strong>Manuell</strong>: Wird aktiv, wenn du „kW setzen“ verwendest; bleibt aktiv bis du wieder einen anderen Modus wählst.</p>
-      </div>
-    </div>
-  )
+    <span style={{ padding: "2px 8px", borderRadius: 999, background: color, color: "white", fontSize: 12 }}>
+      {label || status || "Unbekannt"}
+    </span>
+  );
 }
 
-function EcoSettings({cfg,onSave}){
-  const [sunny,setSunny]=useState(cfg?.sunny_kw??MAX_KW)
-  const [cloudy,setCloudy]=useState(cfg?.cloudy_kw??MIN_KW)
-  const [saving,setSaving]=useState(false)
-  useEffect(()=>{ if(cfg){ setSunny(cfg.sunny_kw); setCloudy(cfg.cloudy_kw) } },[cfg])
-  const clamp=(v)=>Math.max(MIN_KW,Math.min(MAX_KW,Number(v)))
-  const save=async()=>{ setSaving(true); try{ await onSave({sunny_kw:clamp(sunny),cloudy_kw:clamp(cloudy)}); alert("Eco gespeichert.") } finally{ setSaving(false) } }
+function Num({ value, unit, digits = 2 }) {
+  if (value === null || value === undefined) return <span>–</span>;
+  const n = typeof value === "number" ? value : Number(value);
+  if (Number.isNaN(n)) return <span>–</span>;
   return (
-    <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm">
-      <div className="px-4 py-3 border-b border-slate-100"><h3 className="text-sm font-semibold text-slate-800">Eco‑Einstellungen</h3></div>
-      <div className="p-4 grid gap-3 md:grid-cols-3">
-        <label className="text-sm">SUNNY_KW
-          <input type="number" step="0.1" min={MIN_KW} max={MAX_KW} value={sunny} onChange={e=>setSunny(e.target.value)} className="mt-1 block border rounded px-2 py-1 w-full"/>
-        </label>
-        <label className="text-sm">CLOUDY_KW
-          <input type="number" step="0.1" min={MIN_KW} max={MAX_KW} value={cloudy} onChange={e=>setCloudy(e.target.value)} className="mt-1 block border rounded px-2 py-1 w-full"/>
-        </label>
-        <div className="flex items-end">
-          <button disabled={saving} onClick={save} className="px-3 py-2 bg-emerald-600 text-white rounded w-full">{saving?"Speichern…":"Speichern"}</button>
-        </div>
-      </div>
-    </div>
-  )
+    <span>
+      {n.toFixed(digits)} {unit || ""}
+    </span>
+  );
 }
 
-function PricePanel(){
-  const [price,setPrice]=useState(null)
-  const [err,setErr]=useState(null)
-  const load=async()=>{ try{ setErr(null); setPrice(await fetchPrice()) } catch(e){ setErr(e.message||String(e)) } }
-  useEffect(()=>{ load(); const t=setInterval(load,60_000); return()=>clearInterval(t) },[])
-  if(err) return <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm p-4 text-sm text-red-600">Preisfehler: {err}</div>
-  const p = price || {}
-  const cur = p.current_ct_per_kwh
-  const med = p.median_ct_per_kwh
-  const below = p.below_or_equal_median
-  const badge = below===true ? {txt:"≤ Median", cls:"bg-emerald-100 text-emerald-700"} :
-                below===false ? {txt:"> Median", cls:"bg-red-100 text-red-700"} :
-                {txt:"n/a", cls:"bg-slate-100 text-slate-700"}
+function Section({ title, children, right }) {
   return (
-    <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm">
-      <div className="px-4 py-3 border-b border-slate-100"><h3 className="text-sm font-semibold text-slate-800">Aktueller Strompreis</h3></div>
-      <div className="p-4 flex items-center justify-between text-sm">
-        <div>
-          <div className="text-xs text-slate-500">as of</div>
-          <div className="text-slate-700">{p.as_of ? new Date(p.as_of).toLocaleString() : "—"}</div>
-        </div>
-        <div className="text-right">
-          <div className="text-xs text-slate-500">Preis / Median</div>
-          <div className="text-lg font-semibold">
-            {cur!=null ? cur.toFixed(2) : "—"} / {med!=null ? med.toFixed(2) : "—"} ct/kWh
-          </div>
-          <div className={`mt-1 inline-block px-2 py-0.5 rounded-full text-xs ${badge.cls}`}>{badge.txt}</div>
-        </div>
+    <div style={{ marginBottom: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+        <h2 style={{ margin: 0, fontSize: 18 }}>{title}</h2>
+        {right}
       </div>
+      <div style={{ border: "1px solid #e5e7eb", borderRadius: 8, padding: 12, background: "white" }}>{children}</div>
     </div>
-  )
+  );
 }
 
-function WeatherPanel(){
-  const [w,setW]=useState(null)
-  const [err,setErr]=useState(null)
-  const load=async()=>{ try{ setErr(null); setW(await fetchWeather()) } catch(e){ setErr(e.message||String(e)) } }
-  useEffect(()=>{ load(); const t=setInterval(load,60_000); return()=>clearInterval(t) },[])
-  if(err) return <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm p-4 text-sm text-red-600">Wetterfehler: {err}</div>
-  const d = w || {}
-  const t = d.temperature_c
-  const cc = d.cloud_cover_pct
-  const rad = d.shortwave_radiation_wm2
-  const wind = d.wind_speed_ms
-  const precip = d.precip_mm
-  const icon = precip>0.1 ? "🌧️" : (cc>=70 ? "☁️" : (cc>=30 ? "⛅" : "☀️"))
+function PriceBadge({ price }) {
+  if (!price) return null;
+  const { current_ct_per_kwh, median_ct_per_kwh, below_or_equal_median } = price;
+  const bg = below_or_equal_median === true ? "#e6fffa" : below_or_equal_median === false ? "#fff7ed" : "#f3f4f6";
+  const fg = below_or_equal_median === true ? "#0f766e" : below_or_equal_median === false ? "#9a3412" : "#374151";
   return (
-    <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm">
-      <div className="px-4 py-3 border-b border-slate-100"><h3 className="text-sm font-semibold text-slate-800">Wetter</h3></div>
-      <div className="p-4 text-sm flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <span className="text-xl">{icon}</span>
-          <div>
-            <div className="text-slate-700">{t!=null ? `${t.toFixed(1)} °C` : "—"}</div>
-            <div className="text-xs text-slate-500">{d.as_of ? new Date(d.as_of).toLocaleTimeString() : ""}</div>
-          </div>
-        </div>
-        <div className="text-right text-xs text-slate-600">
-          <div>Bewölkung: {cc!=null ? `${cc}%` : "—"}</div>
-          <div>Strahlung: {rad!=null ? `${rad} W/m²` : "—"}</div>
-          <div>Wind: {wind!=null ? `${wind.toFixed?.(1) ?? wind} m/s` : "—"}</div>
-        </div>
-      </div>
+    <div style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "6px 10px", borderRadius: 8, background: bg, color: fg }}>
+      <strong>Preis:</strong>
+      <span>
+        <Num value={current_ct_per_kwh} unit="ct/kWh" digits={2} />
+      </span>
+      <span style={{ fontSize: 12, opacity: 0.8 }}>
+        (Median <Num value={median_ct_per_kwh} unit="ct/kWh" digits={2} />)
+      </span>
+      <span style={{ fontWeight: 600 }}>
+        {below_or_equal_median === true ? "günstig" : below_or_equal_median === false ? "teuer" : "n/a"}
+      </span>
     </div>
-  )
+  );
 }
 
-function StatusBadge({status,error}){
-  const s=(status||"").toLowerCase()
-  let label="Unbekannt", cls="bg-slate-100 text-slate-700"
-  if(s==="available"){ label="Verfügbar"; cls="bg-emerald-100 text-emerald-700" }
-  else if(s==="charging"){ label="Fahrzeug wird geladen"; cls="bg-indigo-100 text-indigo-700" }
-  else if(s==="faulted"){ label="Fehler"; cls="bg-red-100 text-red-700" }
-  else if(s==="preparing"||s==="occupied"){ label="Angesteckt"; cls="bg-amber-100 text-amber-700" }
-  return <span className={`px-2 py-0.5 rounded-full text-xs ${cls}`}>{label}{error&&s==="faulted"?" · "+error:""}</span>
-}
-
-function BoostPanel({point,onSaved}){
-  if(point.mode==="price" || point.mode==="manual"){
-    return <div className="mt-3 text-xs text-slate-500">Boost wird im aktuellen Modus nicht genutzt.</div>
-  }
-  const [enabled,setEnabled]=useState(false)
-  const [cutoff,setCutoff]=useState("07:00")
-  const [target,setTarget]=useState(100)
-  const [loading,setLoading]=useState(true)
-  const [saving,setSaving]=useState(false)
-  useEffect(()=>{ let alive=true;(async()=>{ try{ const b=await fetchBoost(point.id); if(!alive)return; setEnabled(!!b.enabled); setCutoff(b.cutoff_local||"07:00"); setTarget(b.target_soc??100) } finally{ setLoading(false) } })(); return()=>{alive=false} },[point.id])
-  const save=async()=>{ setSaving(true); try{ await saveBoost(point.id,{enabled,cutoff_local:cutoff,target_soc:Number(target)}); onSaved&&onSaved(); alert("Boost gespeichert.") } finally{ setSaving(false) } }
+function WeatherBadge({ weather }) {
+  if (!weather) return null;
+  const { cloud_cover, shortwave_radiation, temperature_2m } = weather || {};
   return (
-    <div className="mt-4 border-t pt-3">
-      <div className="text-sm font-semibold mb-2">Boost (Eco)</div>
-      {loading? <div className="text-sm text-slate-500">Lade…</div> :
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-        <label className="flex items-center gap-2"><input type="checkbox" checked={enabled} onChange={e=>setEnabled(e.target.checked)}/><span>Aktiv</span></label>
-        <label className="text-sm">Bis Uhrzeit
-          <input type="time" value={cutoff} onChange={e=>setCutoff(e.target.value)} className="block border rounded px-2 py-1 w-full mt-1"/>
-        </label>
-        <label className="text-sm">Ziel‑SoC (%)
-          <input type="number" value={target} min={10} max={100} onChange={e=>setTarget(e.target.value)} className="block border rounded px-2 py-1 w-full mt-1"/>
-        </label>
-        <div className="md:col-span-3 flex justify-end">
-          <button disabled={saving} onClick={save} className="px-3 py-2 bg-teal-700 text-white rounded">{saving?"Speichern…":"Speichern"}</button>
-        </div>
-      </div>}
+    <div style={{ display: "inline-flex", alignItems: "center", gap: 12, padding: "6px 10px", borderRadius: 8, background: "#f8fafc" }}>
+      <span>Wolkendecke: <Num value={cloud_cover} unit="%" digits={0} /></span>
+      <span>Globalstrahlung: <Num value={shortwave_radiation} unit="W/m²" digits={0} /></span>
+      <span>Temp: <Num value={temperature_2m} unit="°C" digits={1} /></span>
     </div>
-  )
+  );
 }
 
-function StatsPanel(){
-  const [stats,setStats]=useState(null); const [err,setErr]=useState(null)
-  const load=async()=>{ try{ setErr(null); setStats(await fetchStats()) } catch(e){ setErr(e.message||String(e)) } }
-  useEffect(()=>{ load(); const t=setInterval(load,30000); return()=>clearInterval(t) },[])
-  if(err) return <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm p-4 text-sm text-red-600">Fehler: {err}</div>
-  if(!stats) return <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm p-4 text-sm text-slate-500">Lade Statistik…</div>
-  const total=stats.total||{}
-  return (
-    <div className="rounded-xl border border-slate-200 bg-white/80 shadow-sm">
-      <div className="px-4 py-3 border-b border-slate-100"><h3 className="text-sm font-semibold text-slate-800">Geladene Energie</h3></div>
-      <div className="p-4 text-sm text-slate-700 space-y-3">
-        <div className="flex gap-6">
-          <div><div className="text-xs text-slate-500">Letzte 7 Tage</div><div className="text-xl font-semibold">{Number(total["7d"]||0).toFixed(2)} kWh</div></div>
-          <div><div className="text-xs text-slate-500">Letzte 30 Tage</div><div className="text-xl font-semibold">{Number(total["30d"]||0).toFixed(2)} kWh</div></div>
-        </div>
-      </div>
-    </div>
-  )
-}
+function ChargePointCard({ p, apiBase }) {
+  const [boost, setBoost] = useState(null);
+  const [boostErr, setBoostErr] = useState(null);
+  const [hideBoost, setHideBoost] = useState(false);
 
-// ---- App ----
-export default function App(){
-  const [points,setPoints]=useState([])
-  const [eco,setEco]=useState(null)
-  const [loading,setLoading]=useState(false)
-  const [error,setError]=useState(null)
-
-  const load=async()=>{
-    try{
-      setLoading(true); setError(null)
-      const [pts,cfg]=await Promise.all([fetchPoints(),fetchEco()])
-      setPoints(Array.isArray(pts)?pts:[])
-      setEco(cfg)
-    }catch(e){ setError(e.message||String(e)) }
-    finally{ setLoading(false) }
-  }
-
-  useEffect(()=>{ load(); const t=setInterval(load,5000); return()=>clearInterval(t) },[])
-
-  const doSetMode=async(id,mode)=>{ await setMode(id,mode); load() }
-  const doSetLimit=async(id)=>{
-    const kw=parseFloat(prompt(`Manuelles Ziel kW (${MIN_KW}…${MAX_KW}):`))
-    if(!isNaN(kw)){
-      const v=Math.max(MIN_KW,Math.min(MAX_KW,kw))
-      await setLimit(id,v)  // setzt Modus automatisch auf "manual" im Backend
-      load()
+  const loadBoost = async () => {
+    try {
+      const res = await fetch(`${apiBase}/api/points/${p.id}/boost`);
+      if (res.status === 404) {
+        setHideBoost(true);
+        return;
+      }
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const json = await res.json();
+      setBoost(json);
+      setHideBoost(false);
+      setBoostErr(null);
+    } catch (e) {
+      setBoostErr(e.message || String(e));
     }
-  }
-  const saveEcoCfg=async(d)=>{ await saveEco(d); await load() }
+  };
+
+  useEffect(() => {
+    if (p?.id) loadBoost();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [p?.id]);
+
+  const updateBoost = async (next) => {
+    try {
+      const res = await fetch(`${apiBase}/api/points/${p.id}/boost`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(next),
+      });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const json = await res.json();
+      setBoost(json);
+      setBoostErr(null);
+    } catch (e) {
+      setBoostErr(e.message || String(e));
+    }
+  };
+
+  const toggleBoost = async () => {
+    if (!boost) return;
+    await updateBoost({ ...boost, enabled: !boost.enabled });
+  };
+
+  const setBoostKw = async (kw) => {
+    if (!boost) return;
+    const clamped = Math.max(3.7, Math.min(11.0, Number(kw)));
+    await updateBoost({ ...boost, kw: clamped, enabled: boost.enabled });
+  };
+
+  const session = p.session || {};
+  const fmtTs = (ts) => (ts ? new Date(ts).toLocaleString() : "–");
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800">
-      <header className="sticky top-0 z-10 border-b border-slate-200 bg-white/70 backdrop-blur-sm">
-        <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-2"><div className="w-2.5 h-2.5 rounded-full bg-emerald-500"/><h1 className="text-base font-semibold tracking-tight">Badger‑charge</h1></div>
-          <div className="text-xs text-slate-500">Backend: {API}</div>
+    <div style={{ border: "1px solid #e5e7eb", borderRadius: 10, padding: 14, background: "white" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+        <div>
+          <div style={{ fontWeight: 600, fontSize: 16 }}>{p.id}</div>
+          <div style={{ color: "#6b7280", fontSize: 12 }}>{p.vendor || "—"} {p.model || ""}</div>
+        </div>
+        <StatusPill status={p.status} label={p.status_label} />
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12 }}>
+        <div>
+          <div style={{ color: "#6b7280", fontSize: 12 }}>Leistung</div>
+          <div style={{ fontSize: 20, fontWeight: 600 }}>
+            <Num value={p.power_kw} unit="kW" digits={2} />
+          </div>
+        </div>
+        <div>
+          <div style={{ color: "#6b7280", fontSize: 12 }}>Ziel-Leistung</div>
+          <div style={{ fontSize: 20, fontWeight: 600 }}>
+            <Num value={p.target_kw} unit="kW" digits={2} />
+          </div>
+        </div>
+        <div>
+          <div style={{ color: "#6b7280", fontSize: 12 }}>Energie (Session)</div>
+          <div style={{ fontSize: 20, fontWeight: 600 }}>
+            <Num value={p.energy_kwh_session} unit="kWh" digits={3} />
+          </div>
+        </div>
+        <div>
+          <div style={{ color: "#6b7280", fontSize: 12 }}>SoC</div>
+          <div style={{ fontSize: 20, fontWeight: 600 }}>{p.soc ?? "–"}%</div>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12 }}>
+        <div style={{ color: "#374151", fontSize: 12 }}>
+          <div>Session Start: {fmtTs(session.start)}</div>
+          <div>Last seen: {fmtTs(p.last_seen)}</div>
+          <div>Tx aktiv: {p.tx_active ? "ja" : "nein"}</div>
+        </div>
+
+        {!hideBoost && (
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+              <strong>Boost</strong>
+              <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                <input
+                  type="checkbox"
+                  checked={!!(boost && boost.enabled)}
+                  onChange={toggleBoost}
+                />
+                aktiv
+              </label>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <input
+                type="range"
+                min={3.7}
+                max={11.0}
+                step={0.1}
+                value={boost?.kw ?? 11.0}
+                onChange={(e) => setBoostKw(e.target.value)}
+                style={{ width: 180 }}
+              />
+              <input
+                type="number"
+                min={3.7}
+                max={11.0}
+                step={0.1}
+                value={boost?.kw ?? 11.0}
+                onChange={(e) => setBoostKw(e.target.value)}
+                style={{ width: 90 }}
+              />
+              <span>kW</span>
+            </div>
+            {boostErr && <div style={{ color: "#b91c1c", fontSize: 12, marginTop: 6 }}>{boostErr}</div>}
+            {!boost && <div style={{ color: "#6b7280", fontSize: 12 }}>Lade Boost-Status …</div>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function App() {
+  const { data: points, error: pointsErr } = usePoll(`${API_BASE}/api/points`, 2000, []);
+  const { data: price, error: priceErr } = usePoll(`${API_BASE}/api/price`, 60000, null);
+  const { data: weather, error: weatherErr } = usePoll(`${API_BASE}/api/weather`, 60000, null);
+  const { data: stats } = usePoll(`${API_BASE}/api/stats`, 5000, null);
+
+  return (
+    <div style={{ maxWidth: 1000, margin: "20px auto", padding: "0 16px", fontFamily: "-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif", color: "#111827" }}>
+      <header style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+        <h1 style={{ margin: 0, fontSize: 22 }}>HomeCharger</h1>
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
+          <PriceBadge price={price} />
+          <WeatherBadge weather={weather} />
         </div>
       </header>
 
-      <main className="max-w-5xl mx-auto px-4 py-6 space-y-6">
-        <ModeInfo />
-        <div className="grid md:grid-cols-2 gap-4">
-          <PricePanel />
-          <WeatherPanel />
+      {(priceErr || weatherErr || pointsErr) && (
+        <div style={{ background: "#fef2f2", border: "1px solid #fecaca", color: "#7f1d1d", padding: 8, borderRadius: 8, marginBottom: 12, fontSize: 14 }}>
+          {priceErr && <div>Preis-API Fehler: {priceErr}</div>}
+          {weatherErr && <div>Wetter-API Fehler: {weatherErr}</div>}
+          {pointsErr && <div>Backend Fehler (/api/points): {pointsErr}</div>}
         </div>
-        <EcoSettings cfg={eco} onSave={saveEcoCfg}/>
-        <StatsPanel />
+      )}
 
-        {loading && <div className="text-sm text-slate-500">Lade…</div>}
-        {error && <div className="text-sm text-red-600">Fehler: {error}</div>}
+      <Section
+        title="Ladepunkte"
+        right={<div style={{ color: "#6b7280", fontSize: 12 }}>
+          {stats ? <>aktiv: {stats.charging} · Gesamtleistung: <Num value={stats.total_power_kw} unit="kW" digits={2} /></> : "–"}
+        </div>}
+      >
+        {Array.isArray(points) && points.length > 0 ? (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 12 }}>
+            {points.map((p) => (
+              <ChargePointCard key={p.id} p={p} apiBase={API_BASE} />
+            ))}
+          </div>
+        ) : (
+          <div style={{ color: "#6b7280" }}>
+            Noch keine Ladestation verbunden. Stelle in der Wallbox die WebSocket-URL auf
+            <div style={{ fontFamily: "monospace" }}>wss://homecharger.onrender.com/ocpp/DEINE-CP-ID</div>
+          </div>
+        )}
+      </Section>
 
-        <div className="grid gap-4">
-          {points.map(p=>(
-            <div key={p.id} className="rounded-xl border border-slate-200 bg-white/80 shadow-sm p-4">
-              <div className="flex justify-between gap-4">
-                <div>
-                  <div className="font-semibold">{p.id}</div>
-                  <div className="flex items-center gap-2 text-sm">
-                    <StatusBadge status={p.cp_status} error={p.error_code}/>
-                    <span>· Modus: {p.mode}</span>
-                  </div>
-                  {p.current_soc!=null && <div className="text-xs text-slate-500">SoC: {p.current_soc}%</div>}
-                  {p.last_heartbeat && <div className="text-xs text-slate-500">Letzter Heartbeat: {String(p.last_heartbeat)}</div>}
-                </div>
-                <div className="text-right">
-                  <div className="text-2xl font-bold">{Number(p.target_kw||0).toFixed(2)} kW</div>
-                  <div className="text-xs text-slate-500">Ziel‑Leistung</div>
-                  <div className="mt-1 text-sm">Ist: <strong>{p.current_kw!=null ? Number(p.current_kw).toFixed(2) : "—"}</strong> kW</div>
-                </div>
-              </div>
+      <Section title="Live Logs">
+        <LiveLogs apiBase={API_BASE} />
+      </Section>
 
-              {/* Session-Infos */}
-              <div className="mt-3 text-xs text-slate-600 grid grid-cols-2 gap-2">
-                <div>Session-Start: <strong>{fmtDT(p.session_start_at)}</strong></div>
-                <div>Geladen (aktuell): <strong>{p.session_kwh!=null ? Number(p.session_kwh).toFixed(3) : "—"} kWh</strong></div>
-                <div>Vorauss. Ende: <strong>{fmtTime(p.session_est_end_at)}</strong></div>
-                <div>Transaktion aktiv: <strong>{p.tx_active ? "Ja" : "Nein"}</strong></div>
-              </div>
-
-              <div className="mt-3 flex flex-wrap gap-2">
-                <button onClick={()=>doSetMode(p.id,"eco")} className="px-3 py-1 bg-emerald-600 text-white rounded">Eco</button>
-                <button onClick={()=>doSetMode(p.id,"price")} className="px-3 py-1 bg-cyan-700 text-white rounded">Price</button>
-                <button onClick={()=>doSetMode(p.id,"max")} className="px-3 py-1 bg-indigo-600 text-white rounded">Max</button>
-                <button onClick={()=>doSetMode(p.id,"off")} className="px-3 py-1 bg-slate-600 text-white rounded">Aus</button>
-                <button onClick={()=>doSetLimit(p.id)} className="px-3 py-1 bg-amber-600 text-white rounded">kW setzen (manuell)</button>
-              </div>
-
-              <BoostPanel point={p} onSaved={load}/>
-            </div>
-          ))}
-          {points.length===0 && !loading && <div className="text-slate-500">Noch keine Wallbox verbunden…</div>}
-        </div>
-      </main>
+      <footer style={{ marginTop: 24, color: "#9ca3af", fontSize: 12 }}>
+        API: {API_BASE}
+      </footer>
     </div>
-  )
+  );
 }
