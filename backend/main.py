@@ -1,27 +1,31 @@
 # backend/main.py
 import os
-import logging
-from typing import List, Optional
-from datetime import datetime, timezone, timedelta
-
 import math
 import json
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
+import logging
+from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone, timedelta
 
 import httpx
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 
-# OCPP-Server-Logik
-from ocpp_cs import CentralSystem, extract_cp_id_from_path, KNOWN_CP_IDS, cp_status, cp_registry
+# OCPP-Server-Klasse und Status-Registry
+from ocpp_cs import (
+    CentralSystem,
+    extract_cp_id_from_path,
+    KNOWN_CP_IDS,
+    cp_status,
+    cp_registry,
+)
 
 # -----------------------------------------------------------------------------
 # Logging / CORS
 # -----------------------------------------------------------------------------
-log = logging.getLogger("uvicorn")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+log = logging.getLogger("uvicorn")
 
 def parse_origins(val: str) -> List[str]:
     if not val:
@@ -31,7 +35,7 @@ def parse_origins(val: str) -> List[str]:
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "")
 ALLOWED_ORIGINS = parse_origins(FRONTEND_ORIGIN)
 
-app = FastAPI(title="HomeCharger Backend", version="1.2.0")
+app = FastAPI(title="HomeCharger Backend", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,14 +45,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Static NICHT auf "/" mounten, damit /api/* nicht überschrieben wird
+# WICHTIG: Static NICHT auf "/" mounten, damit /api/* und /ocpp nicht überschrieben werden
 if os.path.isdir("static"):
     app.mount("/app", StaticFiles(directory="static", html=True), name="static")
 
 # -----------------------------------------------------------------------------
-# In-Memory Config (Eco-Settings etc.)
+# In-Memory Config / Defaults
 # -----------------------------------------------------------------------------
-# Defaults: nur SUNNY_KW und CLOUDY_KW steuerbar (3.7–11 kW Grenzen)
+# Standort (Radldorf als Default)
+LAT = float(os.getenv("LAT", "48.83"))
+LON = float(os.getenv("LON", "12.86"))
+
+# Preis-API (A-WATTAR DE ist ohne API-Key)
+PRICE_API_URL = os.getenv("PRICE_API_URL", "https://api.awattar.de/v1/marketdata")
+
+# Eco-Einstellungen (vereinfacht: sunny_kw, cloudy_kw)
 ECO = {
     "sunny_kw": float(os.getenv("SUNNY_KW", "11.0")),
     "cloudy_kw": float(os.getenv("CLOUDY_KW", "3.7")),
@@ -58,11 +69,122 @@ MIN_KW = 3.7
 MAX_KW = 11.0
 
 # -----------------------------------------------------------------------------
-# Health/Debug
+# Helpers
 # -----------------------------------------------------------------------------
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+async def fetch_awattar_current_ct_per_kwh(client: httpx.AsyncClient) -> Optional[float]:
+    """
+    Holt die aktuellen stündlichen Preise von aWATTar und gibt den ct/kWh-Wert
+    für das aktuelle Zeitfenster zurück. aWATTar liefert marketprice in EUR/MWh.
+    Umrechnung: ct/kWh = (EUR/MWh) / 10.
+    """
+    try:
+        r = await client.get(PRICE_API_URL, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("data", [])
+        if not items:
+            return None
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        current = None
+        for it in items:
+            if it.get("start_timestamp") <= now_ms < it.get("end_timestamp"):
+                current = it
+                break
+        if not current:
+            # Fallback: nächstes/letztes Zeitfenster
+            current = items[0]
+        eur_per_mwh = float(current.get("marketprice"))
+        ct_per_kwh = eur_per_mwh / 10.0
+        return round(ct_per_kwh, 3)
+    except Exception as e:
+        log.warning("price fetch error: %s", e)
+        return None
+
+async def fetch_awattar_stats(client: httpx.AsyncClient) -> Dict[str, Any]:
+    """
+    Gibt median_ct_per_kwh über den gelieferten Zeitraum zurück und markiert,
+    ob der aktuelle Preis <= Median liegt.
+    """
+    out = {
+        "as_of": now_iso(),
+        "current_ct_per_kwh": None,
+        "median_ct_per_kwh": None,
+        "below_or_equal_median": None,
+        "source": "awattar",
+    }
+    try:
+        r = await client.get(PRICE_API_URL, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("data", [])
+        if not items:
+            return out
+        prices_ct = [float(it["marketprice"]) / 10.0 for it in items if "marketprice" in it]
+        if prices_ct:
+            prices_ct_sorted = sorted(prices_ct)
+            n = len(prices_ct_sorted)
+            if n % 2 == 1:
+                median = prices_ct_sorted[n // 2]
+            else:
+                median = (prices_ct_sorted[n // 2 - 1] + prices_ct_sorted[n // 2]) / 2.0
+            out["median_ct_per_kwh"] = round(median, 3)
+        # Current
+        out["current_ct_per_kwh"] = await fetch_awattar_current_ct_per_kwh(client)
+        if out["current_ct_per_kwh"] is not None and out["median_ct_per_kwh"] is not None:
+            out["below_or_equal_median"] = out["current_ct_per_kwh"] <= out["median_ct_per_kwh"]
+    except Exception as e:
+        log.warning("price stats error: %s", e)
+    return out
+
+async def fetch_open_meteo(client: httpx.AsyncClient, lat: float, lon: float) -> Dict[str, Any]:
+    """
+    Holt einfache Wetterdaten (aktueller Wolkenanteil, kurzwellige Strahlung, Temperatur).
+    """
+    out = {
+        "as_of": now_iso(),
+        "latitude": lat,
+        "longitude": lon,
+        "cloud_cover": None,
+        "shortwave_radiation": None,
+        "temperature_2m": None,
+        "weather_code": None,
+        "source": "open-meteo",
+    }
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        "&current=cloud_cover,shortwave_radiation,temperature_2m,weather_code"
+        "&timezone=auto"
+    )
+    try:
+        r = await client.get(url, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        cur = data.get("current", {})
+        out["cloud_cover"] = cur.get("cloud_cover")
+        out["shortwave_radiation"] = cur.get("shortwave_radiation")
+        out["temperature_2m"] = cur.get("temperature_2m")
+        out["weather_code"] = cur.get("weather_code")
+    except Exception as e:
+        log.warning("weather fetch error: %s", e)
+    return out
+
+# -----------------------------------------------------------------------------
+# Health / Debug / Root
+# -----------------------------------------------------------------------------
+@app.get("/")
+async def root():
+    return JSONResponse({"message": "HomeCharger Backend up. See /api/points and /ocpp/{cp_id}."})
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "as_of": now_iso()}
 
 @app.head("/health")
 async def health_head():
@@ -70,219 +192,153 @@ async def health_head():
 
 @app.get("/debug/routes")
 def debug_routes():
-    return sorted([r.path for r in app.router.routes])
-
-@app.get("/")
-async def root():
-    return JSONResponse({"message": "HomeCharger Backend up. See /api/points and /ocpp/{cp_id}."})
-
-@app.head("/")
-async def root_head():
-    return Response(status_code=200)
+    routes = sorted([r.path for r in app.router.routes])
+    return routes
 
 # -----------------------------------------------------------------------------
-# API: OCPP-Status
+# API: Points / Stats / Eco / Price / Weather
 # -----------------------------------------------------------------------------
 @app.get("/api/points")
 async def api_points():
-    return list(cp_status.values())
+    """
+    Liefert alle bekannten Ladepunkte mit Status (aus cp_status).
+    """
+    # flache Kopie für stabile Ausgabe
+    out = []
+    for cid, st in cp_status.items():
+        out.append(st)
+    return out
 
-# Optionaler Alias, falls dein Frontend mal /api/point ruft
-@app.get("/api/point")
-async def api_point():
-    items = list(cp_status.values())
-    return items[0] if items else {}
+@app.get("/api/stats")
+async def api_stats():
+    """
+    Kleiner Überblick über Sessions/Leistung.
+    """
+    sessions = []
+    for st in cp_status.values():
+        sess = st.get("session") or {}
+        sessions.append({
+            "id": st.get("id"),
+            "status": st.get("status"),
+            "start": sess.get("start"),
+            "end": sess.get("end"),
+            "energy_kwh": st.get("energy_kwh_session", 0.0),
+            "power_kw": st.get("power_kw", 0.0),
+            "soc": st.get("soc"),
+        })
+    return {"as_of": now_iso(), "sessions": sessions}
 
-# -----------------------------------------------------------------------------
-# API: Eco-Settings (nur sunny_kw, cloudy_kw)
-# -----------------------------------------------------------------------------
 @app.get("/api/eco")
-async def get_eco():
-    return ECO
-
-# Kompatibilitäts-Alias: /api/settings führt auf dasselbe
-@app.get("/api/settings")
-async def get_settings():
+async def api_eco_get():
     return ECO
 
 @app.post("/api/eco")
-async def set_eco(payload: dict):
+async def api_eco_set(payload: Dict[str, Any]):
+    """
+    Erwartet z. B. {"sunny_kw": 11.0, "cloudy_kw": 3.7}
+    """
+    sunny = payload.get("sunny_kw", ECO["sunny_kw"])
+    cloudy = payload.get("cloudy_kw", ECO["cloudy_kw"])
     try:
-        sunny = float(payload.get("sunny_kw", ECO["sunny_kw"]))
-        cloudy = float(payload.get("cloudy_kw", ECO["cloudy_kw"]))
-        # Grenzen erzwingen
-        sunny = max(MIN_KW, min(MAX_KW, sunny))
-        cloudy = max(MIN_KW, min(MAX_KW, cloudy))
-        ECO.update({
-            "sunny_kw": sunny,
-            "cloudy_kw": cloudy,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        })
-        return ECO
-    except Exception as e:
-        log.exception("set_eco error: %s", e)
+        sunny = float(sunny)
+        cloudy = float(cloudy)
+    except Exception:
         return JSONResponse({"error": "invalid payload"}, status_code=400)
+    ECO["sunny_kw"] = clamp(sunny, MIN_KW, MAX_KW)
+    ECO["cloudy_kw"] = clamp(cloudy, MIN_KW, MAX_KW)
+    ECO["updated_at"] = now_iso()
+    return ECO
 
-@app.post("/api/settings")
-async def set_settings(payload: dict):
-    return await set_eco(payload)
-
-# -----------------------------------------------------------------------------
-# API: Preis (aWATTar stündlich, ohne API-Key)
-#   PRICE_API_URL kann überschrieben werden; Default aWATTar DE.
-#   Antwort: { as_of, current_ct_per_kwh, median_ct_per_kwh, below_or_equal_median }
-# -----------------------------------------------------------------------------
-PRICE_API_URL = os.getenv("PRICE_API_URL", "https://api.awattar.de/v1/marketdata")
-
-async def fetch_prices_awattar(url: str) -> list[dict]:
-    # aWATTar liefert Felder: start_timestamp (ms), end_timestamp (ms), marketprice (€/MWh)
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        data = resp.json()
-    items = data.get("data", data)  # manche Proxies geben data direkt zurück
-    out = []
-    for it in items:
-        start_ms = it.get("start_timestamp") or it.get("start") or it.get("startTime")
-        price_eur_per_mwh = it.get("marketprice") or it.get("price")
-        if start_ms is None or price_eur_per_mwh is None:
-            continue
-        # €/MWh -> ct/kWh: (€/MWh / 1000) * 100 = €/kWh*100ct/€ = /10
-        ct_per_kwh = float(price_eur_per_mwh) / 10.0
-        out.append({
-            "start": int(start_ms),
-            "ct_per_kwh": ct_per_kwh,
-        })
-    # nach Start sortieren
-    out.sort(key=lambda x: x["start"])
-    return out
-
-def pick_current_price(items: list[dict], now_ms: int) -> Optional[float]:
-    # aWATTar liefert stündliche Blöcke; wir nehmen den Block, dessen Start <= now < next_start
-    for idx, it in enumerate(items):
-        start = it["start"]
-        end = items[idx + 1]["start"] if idx + 1 < len(items) else start + 3600_000
-        if start <= now_ms < end:
-            return it["ct_per_kwh"]
-    return items[-1]["ct_per_kwh"] if items else None
+# Alias für bestehendes Frontend (vermeidet 404)
+@app.get("/api/config/eco")
+async def api_config_eco_alias():
+    return ECO
 
 @app.get("/api/price")
 async def api_price():
-    try:
-        items = await fetch_prices_awattar(PRICE_API_URL)
-        if not items:
-            return {
-                "as_of": datetime.now(timezone.utc).isoformat(),
-                "current_ct_per_kwh": None,
-                "median_ct_per_kwh": None,
-                "below_or_equal_median": None,
-            }
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        current = pick_current_price(items, now_ms)
-        vals = [x["ct_per_kwh"] for x in items]
-        median = sorted(vals)[len(vals)//2] if vals else None
-        below = None
-        if current is not None and median is not None:
-            below = current <= median
-        return {
-            "as_of": datetime.now(timezone.utc).isoformat(),
-            "current_ct_per_kwh": current,
-            "median_ct_per_kwh": median,
-            "below_or_equal_median": below,
-        }
-    except httpx.HTTPStatusError as e:
-        log.warning("price upstream %s: %s", e.response.status_code, e)
-        return JSONResponse({"error": f"upstream {e.response.status_code}"}, status_code=502)
-    except Exception as e:
-        log.exception("price error: %s", e)
-        return JSONResponse({"error": "price error"}, status_code=500)
-
-# -----------------------------------------------------------------------------
-# API: Wetter (Open-Meteo, ohne Key)
-#   Per ENV konfigurierbar: LAT, LON. Default = Radldorf (ca.).
-#   Antwort: { as_of, cloud_cover_percent, ghi_w_m2, summary }
-# -----------------------------------------------------------------------------
-LAT = float(os.getenv("LAT", "48.83"))
-LON = float(os.getenv("LON", "12.86"))
-
-OPEN_METEO_URL = os.getenv(
-    "WEATHER_API_URL",
-    f"https://api.open-meteo.com/v1/forecast?latitude={LAT}&longitude={LON}&current=cloud_cover,shortwave_radiation,temperature_2m,weather_code&timezone=auto"
-)
+    async with httpx.AsyncClient() as client:
+        stats = await fetch_awattar_stats(client)
+    return stats
 
 @app.get("/api/weather")
 async def api_weather():
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(OPEN_METEO_URL)
-            resp.raise_for_status()
-            data = resp.json()
-        cur = data.get("current", {})
-        cloud = cur.get("cloud_cover")
-        ghi = cur.get("shortwave_radiation")
-        summary = {
-            "temp_c": cur.get("temperature_2m"),
-            "weather_code": cur.get("weather_code"),
-        }
-        return {
-            "as_of": datetime.now(timezone.utc).isoformat(),
-            "cloud_cover_percent": cloud,
-            "ghi_w_m2": ghi,
-            "summary": summary,
-        }
-    except httpx.HTTPStatusError as e:
-        log.warning("weather upstream %s: %s", e.response.status_code, e)
-        return JSONResponse({"error": f"upstream {e.response.status_code}"}, status_code=502)
-    except Exception as e:
-        log.exception("weather error: %s", e)
-        return JSONResponse({"error": "weather error"}, status_code=500)
+    async with httpx.AsyncClient() as client:
+        weather = await fetch_open_meteo(client, LAT, LON)
+    return weather
 
 # -----------------------------------------------------------------------------
-# OCPP-WebSocket: akzeptiere /ocpp, /ocpp/{cp_id}, /ocpp/{cp_id}/{tail}
-#   (tolerant gegen doppelte ID in der URL)
+# OCPP WebSocket Endpoints (1.6 JSON, Subprotocol: 'ocpp1.6')
 # -----------------------------------------------------------------------------
-class StarletteWSAdapter:
-    def __init__(self, ws: WebSocket):
-        self.ws = ws
+class FastAPIWebSocketWrapper:
+    """
+    Adaptiert fastapi.WebSocket auf das Interface, das die ocpp-Bibliothek erwartet:
+    - send(str)
+    - recv() -> str
+    und stellt subprotocol bereit.
+    """
+    def __init__(self, ws: WebSocket, subprotocol: str = "ocpp1.6"):
+        self._ws = ws
+        self.subprotocol = subprotocol
+
+    async def send(self, message: str):
+        await self._ws.send_text(message)
+
     async def recv(self) -> str:
-        return await self.ws.receive_text()
-    async def send(self, data: str):
-        await self.ws.send_text(data)
-    async def close(self, code: int = 1000, reason: str = ""):
-        try:
-            await self.ws.close(code=code)
-        except Exception:
-            pass
+        return await self._ws.receive_text()
 
-@app.websocket("/ocpp")
-@app.websocket("/ocpp/{cp_id}")
-@app.websocket("/ocpp/{cp_id}/{tail:path}")
-async def ocpp_ws(ws: WebSocket, cp_id: str | None = None, tail: str | None = None):
-    # Subprotocol versuchen
-    try:
-        await ws.accept(subprotocol="ocpp1.6")
-    except Exception:
-        await ws.accept()
+async def _serve_ocpp(websocket: WebSocket, path_override: Optional[str] = None):
+    """
+    Gemeinsame Handler-Logik für alle /ocpp*-Routen.
+    """
+    # Subprotocol aushandeln (zwingend für viele Boxen)
+    await websocket.accept(subprotocol="ocpp1.6")
 
-    if not cp_id:
-        cp_id = extract_cp_id_from_path("/ocpp")
+    # CP-ID aus dem URL-Pfad extrahieren (robust gegen doppelte IDs)
+    path = path_override or websocket.url.path
+    cp_id = extract_cp_id_from_path(path)
+    if not cp_id or cp_id.lower() == "unknown":
+        # versuche Header-basiert (einige Boxen senden sie so)
+        cp_id = (websocket.headers.get("Sec-WebSocket-Protocol") or "").replace("ocpp1.6", "").strip() or "unknown"
 
-    # Whitelist prüfen
+    # Whitelist prüfen (falls gesetzt)
     if KNOWN_CP_IDS and cp_id not in KNOWN_CP_IDS:
-        log.warning("Reject OCPP for unknown CP-ID: %s (tail=%s)", cp_id, tail)
-        await ws.close(code=4000)
+        log.info("connection rejected (403 Forbidden) for cp_id=%s", cp_id)
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    log.info("OCPP connect (ASGI): %s (tail=%s)", cp_id, tail)
-    adapter = StarletteWSAdapter(ws)
-    cp = CentralSystem(cp_id, adapter)
-    cp_registry[cp_id] = cp
+    log.info("OCPP connect (ASGI): %s (tail=None)", cp_id)
+    connection = FastAPIWebSocketWrapper(websocket, subprotocol="ocpp1.6")
+    cp = CentralSystem(cp_id, connection)
+    cp_registry[cp_id] = cp  # registrieren
+
     try:
-        await cp.start()  # blockiert bis Disconnect
+        await cp.start()  # blockiert, bis die Verbindung beendet wird
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        log.exception("OCPP ASGI session error (%s): %s", cp_id, e)
+        log.error("OCPP ASGI session error (%s): %s", cp_id, e, exc_info=True)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
     finally:
-        cp_registry.pop(cp_id, None)
         log.info("OCPP disconnect (ASGI): %s", cp_id)
+        # Optional: aufräumen, aber Status behalten
+        # cp_registry.pop(cp_id, None)
+
+@app.websocket("/ocpp")
+async def ocpp_ws_root(websocket: WebSocket):
+    await _serve_ocpp(websocket)
+
+@app.websocket("/ocpp/{cp_id}")
+async def ocpp_ws_with_id(websocket: WebSocket, cp_id: str):
+    # Wir nutzen den echten Pfad, um doppelte IDs zu erkennen (…/ocpp/123/123)
+    await _serve_ocpp(websocket)
+
+@app.websocket("/ocpp/{cp_id}/{tail:path}")
+async def ocpp_ws_with_tail(websocket: WebSocket, cp_id: str, tail: str):
+    await _serve_ocpp(websocket)
+
+# -----------------------------------------------------------------------------
+# Ende
+# -----------------------------------------------------------------------------
