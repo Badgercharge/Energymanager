@@ -1,18 +1,17 @@
 # backend/main.py
 import os
-import math
 import json
 import logging
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-# OCPP-Server-Klasse und Status-Registry
+# OCPP-Server-Klasse und Status-Registry (aus deiner ocpp_cs.py)
 from ocpp_cs import (
     CentralSystem,
     extract_cp_id_from_path,
@@ -22,7 +21,7 @@ from ocpp_cs import (
 )
 
 # -----------------------------------------------------------------------------
-# Logging / CORS
+# Logging / App
 # -----------------------------------------------------------------------------
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("uvicorn")
@@ -35,7 +34,7 @@ def parse_origins(val: str) -> List[str]:
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "")
 ALLOWED_ORIGINS = parse_origins(FRONTEND_ORIGIN)
 
-app = FastAPI(title="HomeCharger Backend", version="1.4.0")
+app = FastAPI(title="HomeCharger Backend", version="1.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,28 +44,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# WICHTIG: Static NICHT auf "/" mounten, damit /api/* und /ocpp nicht überschrieben werden
+# Wichtig: Static NICHT auf "/" mounten, damit /api/* und /ocpp nicht überschrieben werden
 if os.path.isdir("static"):
     app.mount("/app", StaticFiles(directory="static", html=True), name="static")
 
 # -----------------------------------------------------------------------------
-# In-Memory Config / Defaults
+# Standort / Konfiguration
 # -----------------------------------------------------------------------------
-# Standort (Radldorf als Default)
-LAT = float(os.getenv("LAT", "48.83"))
+LAT = float(os.getenv("LAT", "48.83"))   # Radldorf
 LON = float(os.getenv("LON", "12.86"))
 
-# Preis-API (A-WATTAR DE ist ohne API-Key)
+# Preis: A-WATTAR Deutschland (ohne API-Key)
 PRICE_API_URL = os.getenv("PRICE_API_URL", "https://api.awattar.de/v1/marketdata")
 
-# Eco-Einstellungen (vereinfacht: sunny_kw, cloudy_kw)
-ECO = {
-    "sunny_kw": float(os.getenv("SUNNY_KW", "11.0")),
-    "cloudy_kw": float(os.getenv("CLOUDY_KW", "3.7")),
-    "updated_at": datetime.now(timezone.utc).isoformat(),
-}
+# Eco-Settings (vereinfacht: sunny_kw, cloudy_kw)
 MIN_KW = 3.7
 MAX_KW = 11.0
+ECO = {
+    "sunny_kw": float(os.getenv("SUNNY_KW", f"{MAX_KW}")),
+    "cloudy_kw": float(os.getenv("CLOUDY_KW", f"{MIN_KW}")),
+    "updated_at": datetime.now(timezone.utc).isoformat(),
+}
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -77,10 +75,22 @@ def now_iso() -> str:
 def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
+STATUS_LABELS = {
+    "unknown": "Unbekannt",
+    "available": "Bereit",
+    "preparing": "Vorbereitung",
+    "charging": "Lädt",
+    "suspended_ev": "Pausiert (EV)",
+    "suspendedev": "Pausiert (EV)",
+    "suspended_evse": "Pausiert (EVSE)",
+    "suspendedevse": "Pausiert (EVSE)",
+    "finishing": "Beenden",
+    "faulted": "Fehler",
+}
+
 async def fetch_awattar_current_ct_per_kwh(client: httpx.AsyncClient) -> Optional[float]:
     """
-    Holt die aktuellen stündlichen Preise von aWATTar und gibt den ct/kWh-Wert
-    für das aktuelle Zeitfenster zurück. aWATTar liefert marketprice in EUR/MWh.
+    A-WATTAR liefert marketprice in EUR/MWh.
     Umrechnung: ct/kWh = (EUR/MWh) / 10.
     """
     try:
@@ -97,20 +107,14 @@ async def fetch_awattar_current_ct_per_kwh(client: httpx.AsyncClient) -> Optiona
                 current = it
                 break
         if not current:
-            # Fallback: nächstes/letztes Zeitfenster
             current = items[0]
         eur_per_mwh = float(current.get("marketprice"))
-        ct_per_kwh = eur_per_mwh / 10.0
-        return round(ct_per_kwh, 3)
+        return round(eur_per_mwh / 10.0, 3)
     except Exception as e:
         log.warning("price fetch error: %s", e)
         return None
 
 async def fetch_awattar_stats(client: httpx.AsyncClient) -> Dict[str, Any]:
-    """
-    Gibt median_ct_per_kwh über den gelieferten Zeitraum zurück und markiert,
-    ob der aktuelle Preis <= Median liegt.
-    """
     out = {
         "as_of": now_iso(),
         "current_ct_per_kwh": None,
@@ -134,7 +138,6 @@ async def fetch_awattar_stats(client: httpx.AsyncClient) -> Dict[str, Any]:
             else:
                 median = (prices_ct_sorted[n // 2 - 1] + prices_ct_sorted[n // 2]) / 2.0
             out["median_ct_per_kwh"] = round(median, 3)
-        # Current
         out["current_ct_per_kwh"] = await fetch_awattar_current_ct_per_kwh(client)
         if out["current_ct_per_kwh"] is not None and out["median_ct_per_kwh"] is not None:
             out["below_or_equal_median"] = out["current_ct_per_kwh"] <= out["median_ct_per_kwh"]
@@ -143,9 +146,6 @@ async def fetch_awattar_stats(client: httpx.AsyncClient) -> Dict[str, Any]:
     return out
 
 async def fetch_open_meteo(client: httpx.AsyncClient, lat: float, lon: float) -> Dict[str, Any]:
-    """
-    Holt einfache Wetterdaten (aktueller Wolkenanteil, kurzwellige Strahlung, Temperatur).
-    """
     out = {
         "as_of": now_iso(),
         "latitude": lat,
@@ -182,6 +182,10 @@ async def fetch_open_meteo(client: httpx.AsyncClient, lat: float, lon: float) ->
 async def root():
     return JSONResponse({"message": "HomeCharger Backend up. See /api/points and /ocpp/{cp_id}."})
 
+@app.head("/")
+async def root_head():
+    return Response(status_code=200)
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "as_of": now_iso()}
@@ -201,18 +205,57 @@ def debug_routes():
 @app.get("/api/points")
 async def api_points():
     """
-    Liefert alle bekannten Ladepunkte mit Status (aus cp_status).
+    Liefert Status der Ladepunkte inkl. UI‑Aliase und stabilen Default‑Werten,
+    damit das Frontend nie null/undefined anzeigen muss.
     """
-    # flache Kopie für stabile Ausgabe
     out = []
     for cid, st in cp_status.items():
-        out.append(st)
+        sess = st.get("session") or {}
+        status_raw = (st.get("status") or "Unknown")
+        status_key = str(status_raw).replace(" ", "_").lower()
+        status_label = STATUS_LABELS.get(status_key, "Unbekannt")
+
+        power_kw = st.get("power_kw")
+        if power_kw is None:
+            power_kw = 0.0
+        energy_kwh_session = st.get("energy_kwh_session")
+        if energy_kwh_session is None:
+            energy_kwh_session = 0.0
+
+        out.append({
+            "id": cid,
+            "status": status_raw,
+            "status_label": status_label,
+
+            # Leistung
+            "power_kw": round(float(power_kw), 3),
+            "current_kw": round(float(power_kw), 3),  # UI-Alias
+            "target_kw": (st.get("target_kw") if st.get("target_kw") is not None else 0.0),
+            "mode": st.get("mode"),
+
+            # Transaktion
+            "tx_active": bool(st.get("tx_active")),
+            "transaction_active": bool(st.get("tx_active")),  # UI-Alias
+
+            # Session
+            "energy_kwh_session": round(float(energy_kwh_session), 3),
+            "energy_kwh": round(float(energy_kwh_session), 3),  # UI-Alias
+            "session_start": (sess.get("start") or None),
+            "session_end": (sess.get("end") or None),
+            "est_end": (sess.get("est_end") or None),
+
+            # Sonstiges
+            "soc": st.get("soc"),
+            "last_seen": st.get("last_seen"),
+            "model": st.get("model"),
+            "vendor": st.get("vendor"),
+        })
     return out
 
 @app.get("/api/stats")
 async def api_stats():
     """
-    Kleiner Überblick über Sessions/Leistung.
+    Kleiner Überblick über Sessions/Leistung (aggregiert aus cp_status).
     """
     sessions = []
     for st in cp_status.values():
@@ -249,7 +292,7 @@ async def api_eco_set(payload: Dict[str, Any]):
     ECO["updated_at"] = now_iso()
     return ECO
 
-# Alias für bestehendes Frontend (vermeidet 404)
+# Legacy-Alias, um 404 im Frontend zu vermeiden
 @app.get("/api/config/eco")
 async def api_config_eco_alias():
     return ECO
@@ -297,16 +340,18 @@ async def _serve_ocpp(websocket: WebSocket, path_override: Optional[str] = None)
     path = path_override or websocket.url.path
     cp_id = extract_cp_id_from_path(path)
     if not cp_id or cp_id.lower() == "unknown":
-        # versuche Header-basiert (einige Boxen senden sie so)
-        cp_id = (websocket.headers.get("Sec-WebSocket-Protocol") or "").replace("ocpp1.6", "").strip() or "unknown"
+        # als Fallback (manche Boxen übergeben sie im Subprotocol-Header)
+        proto_hdr = websocket.headers.get("Sec-WebSocket-Protocol") or ""
+        cp_id = proto_hdr.replace("ocpp1.6", "").strip() or "unknown"
 
     # Whitelist prüfen (falls gesetzt)
     if KNOWN_CP_IDS and cp_id not in KNOWN_CP_IDS:
         log.info("connection rejected (403 Forbidden) for cp_id=%s", cp_id)
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        # WS-Close 1008 (Policy Violation)
+        await websocket.close(code=1008)
         return
 
-    log.info("OCPP connect (ASGI): %s (tail=None)", cp_id)
+    log.info("OCPP connect (ASGI): %s", cp_id)
     connection = FastAPIWebSocketWrapper(websocket, subprotocol="ocpp1.6")
     cp = CentralSystem(cp_id, connection)
     cp_registry[cp_id] = cp  # registrieren
@@ -323,8 +368,7 @@ async def _serve_ocpp(websocket: WebSocket, path_override: Optional[str] = None)
             pass
     finally:
         log.info("OCPP disconnect (ASGI): %s", cp_id)
-        # Optional: aufräumen, aber Status behalten
-        # cp_registry.pop(cp_id, None)
+        # cp_registry.pop(cp_id, None)  # optional aufräumen
 
 @app.websocket("/ocpp")
 async def ocpp_ws_root(websocket: WebSocket):
@@ -332,13 +376,10 @@ async def ocpp_ws_root(websocket: WebSocket):
 
 @app.websocket("/ocpp/{cp_id}")
 async def ocpp_ws_with_id(websocket: WebSocket, cp_id: str):
-    # Wir nutzen den echten Pfad, um doppelte IDs zu erkennen (…/ocpp/123/123)
+    # Die CP-ID steckt in der URL – dennoch verwendet extract_cp_id_from_path
     await _serve_ocpp(websocket)
 
 @app.websocket("/ocpp/{cp_id}/{tail:path}")
 async def ocpp_ws_with_tail(websocket: WebSocket, cp_id: str, tail: str):
+    # Fängt Sonderfälle wie /ocpp/<id>/<id> ab (manche Boxen hängen sie doppelt an)
     await _serve_ocpp(websocket)
-
-# -----------------------------------------------------------------------------
-# Ende
-# -----------------------------------------------------------------------------
